@@ -1205,10 +1205,24 @@ class _FakeResp:
 _INDEX_ENV_VARS = ("OMNIGENT_INDEX_URL", "UV_DEFAULT_INDEX", "UV_INDEX_URL", "PIP_INDEX_URL")
 
 
-def _clear_index_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Unset every index env var so a test starts from the pypi.org default."""
-    for var in _INDEX_ENV_VARS:
+def _delenv_index(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset every index env var (plus ``PIP_CONFIG_FILE``)."""
+    for var in (*_INDEX_ENV_VARS, "PIP_CONFIG_FILE"):
         monkeypatch.delenv(var, raising=False)
+
+
+def _clear_index_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start from the pypi.org default, ignoring the host's real config.
+
+    Unsets the index env vars AND stubs the uv/pip config readers to
+    ``""`` so a developer's real ``~/.config/uv/uv.toml`` / ``pip.conf``
+    (e.g. a corporate mirror) can't leak into tests that assert the
+    default index. Config-file resolution itself is covered by the
+    dedicated ``test_resolve_index_url_from_*`` tests.
+    """
+    _delenv_index(monkeypatch)
+    monkeypatch.setattr("omnigent.update_check._index_from_uv_config", lambda: "")
+    monkeypatch.setattr("omnigent.update_check._index_from_pip_config", lambda: "")
 
 
 def test_fetch_latest_version_pep691_json(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1330,6 +1344,88 @@ def test_resolve_index_url_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
     # Multiple whitespace/comma-separated URLs → the first (primary) index.
     monkeypatch.setenv("OMNIGENT_INDEX_URL", "https://a.example/simple, https://b.example/simple")
     assert _resolve_index_url() == "https://a.example/simple"
+
+
+def test_resolve_index_url_from_uv_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No env var → uv.toml's ``index-url`` is used (corp-mirror-in-a-file case)."""
+    from omnigent.update_check import _resolve_index_url
+
+    _delenv_index(monkeypatch)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    # Isolate the uv path under test from any real pip.conf on the box.
+    monkeypatch.setattr("omnigent.update_check._index_from_pip_config", lambda: "")
+    uv_toml = tmp_path / "uv" / "uv.toml"
+    uv_toml.parent.mkdir(parents=True)
+    uv_toml.write_text('index-url = "https://uvcfg.example/simple/"\n')
+
+    assert _resolve_index_url() == "https://uvcfg.example/simple"
+
+
+def test_resolve_index_url_from_uv_default_index_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``[[index]]`` marked ``default = true`` wins; a plain one is ignored."""
+    from omnigent.update_check import _resolve_index_url
+
+    _delenv_index(monkeypatch)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.update_check._index_from_pip_config", lambda: "")
+    uv_toml = tmp_path / "uv" / "uv.toml"
+    uv_toml.parent.mkdir(parents=True)
+    uv_toml.write_text(
+        '[[index]]\nname = "pub"\nurl = "https://pub.example/simple"\n\n'
+        '[[index]]\nname = "corp"\nurl = "https://corp.example/simple"\ndefault = true\n'
+    )
+
+    assert _resolve_index_url() == "https://corp.example/simple"
+
+
+def test_resolve_index_url_ignores_non_default_uv_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A supplementary ``[[index]]`` (no ``default``) does not override pypi.org."""
+    from omnigent.update_check import _resolve_index_url
+
+    _delenv_index(monkeypatch)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.update_check._index_from_pip_config", lambda: "")
+    uv_toml = tmp_path / "uv" / "uv.toml"
+    uv_toml.parent.mkdir(parents=True)
+    uv_toml.write_text('[[index]]\nname = "extra"\nurl = "https://extra.example/simple"\n')
+
+    assert _resolve_index_url() == "https://pypi.org/simple"
+
+
+def test_resolve_index_url_from_pip_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """uv has nothing → pip.conf's ``[global] index-url`` is used."""
+    from omnigent.update_check import _resolve_index_url
+
+    _delenv_index(monkeypatch)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.update_check._index_from_uv_config", lambda: "")
+    pip_conf = tmp_path / "pip" / "pip.conf"
+    pip_conf.parent.mkdir(parents=True)
+    pip_conf.write_text("[global]\nindex-url = https://pipcfg.example/simple/\n")
+
+    assert _resolve_index_url() == "https://pipcfg.example/simple"
+
+
+def test_resolve_index_url_env_beats_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An index env var takes precedence over a configured one."""
+    from omnigent.update_check import _resolve_index_url
+
+    _delenv_index(monkeypatch)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    uv_toml = tmp_path / "uv" / "uv.toml"
+    uv_toml.parent.mkdir(parents=True)
+    uv_toml.write_text('index-url = "https://uvcfg.example/simple"\n')
+    monkeypatch.setenv("UV_INDEX_URL", "https://env.example/simple")
+
+    assert _resolve_index_url() == "https://env.example/simple"
 
 
 def test_refresh_update_cache_writes_latest_and_preserves_notified(

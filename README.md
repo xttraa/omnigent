@@ -127,9 +127,9 @@ local server (pass `--force` to stop them immediately); the next `omni` command
 brings the server back up on the new version. Source checkouts update with
 `git pull` instead. Silence the notice with `OMNIGENT_NO_UPDATE_CHECK=1`.
 
-The check queries your configured package index (honoring `UV_INDEX_URL` /
-`PIP_INDEX_URL`, default PyPI); point it elsewhere with `OMNIGENT_INDEX_URL` if
-you install from a private mirror.
+The check queries your configured package index — honoring `UV_INDEX_URL` /
+`PIP_INDEX_URL` and your `uv.toml` / `pip.conf` (default PyPI), so private
+mirrors work out of the box; override with `OMNIGENT_INDEX_URL` if needed.
 
 </details>
 

@@ -16,10 +16,13 @@ Two install shapes are supported:
   latest release on the *configured package index* (via the Simple
   Repository API — :func:`fetch_latest_version`) and nag *only when a
   strictly newer release exists* — never merely because the install is
-  old. The index is resolved from ``UV_INDEX_URL`` / ``PIP_INDEX_URL`` /
-  ``OMNIGENT_INDEX_URL`` (default pypi.org), so it works on corporate
-  mirrors and air-gapped networks and stays consistent with what
-  ``omni upgrade`` actually pulls. To avoid adding latency to the hot
+  old. The index is resolved from ``OMNIGENT_INDEX_URL`` /
+  ``UV_INDEX_URL`` / ``PIP_INDEX_URL`` or, failing those, the uv/pip
+  *config files* (``uv.toml`` / ``pip.conf``); default pypi.org. So it
+  works on corporate mirrors and air-gapped networks — even when the
+  mirror is configured in a file rather than an env var — and stays
+  consistent with what ``omni upgrade`` actually pulls. To avoid adding
+  latency to the hot
   path, the foreground only ever reads the cached "latest version" and
   prints from it; the (network) lookup runs in a detached background
   process (:func:`refresh_update_cache`) that refreshes the cache for the
@@ -69,10 +72,11 @@ _DIST_NAME = "omnigent"
 # notice consistent with what ``omni upgrade`` (uv/pip) actually pulls.
 _DEFAULT_INDEX_URL = "https://pypi.org/simple"
 # Env vars that point at the default index, in precedence order. The
-# explicit ``OMNIGENT_INDEX_URL`` wins; then uv's and pip's. Config-file
-# index URLs (uv.toml / pip.conf) are intentionally NOT parsed — set the
-# env override for those. Credentials embedded in the URL are honored
-# (httpx applies them), so authenticated mirrors work transparently.
+# explicit ``OMNIGENT_INDEX_URL`` wins; then uv's and pip's. When none is
+# set, :func:`_resolve_index_url` falls back to uv/pip *config files*
+# (uv.toml / pip.conf), so a mirror configured there is honored too.
+# Credentials embedded in the URL are honored (httpx applies them), so
+# authenticated mirrors work transparently.
 _INDEX_ENV_VARS = ("OMNIGENT_INDEX_URL", "UV_DEFAULT_INDEX", "UV_INDEX_URL", "PIP_INDEX_URL")
 # PEP 691 JSON content type to request (falls back to PEP 503 HTML).
 _SIMPLE_JSON_ACCEPT = "application/vnd.pypi.simple.v1+json"
@@ -315,11 +319,21 @@ def _is_newer(latest: str, current: str) -> bool:
 
 
 def _resolve_index_url() -> str:
-    """Resolve the package index to query, honoring uv/pip env config.
+    """Resolve the package index to query, honoring uv/pip config.
 
-    Checks :data:`_INDEX_ENV_VARS` in precedence order and falls back to
-    :data:`_DEFAULT_INDEX_URL`. uv's index vars may carry several
-    whitespace/comma-separated URLs; the first is the primary index.
+    Precedence, mirroring how ``uv`` / ``pip`` (and therefore
+    ``omni upgrade``) actually pick an index:
+
+    1. index env vars (:data:`_INDEX_ENV_VARS`) — explicit
+       ``OMNIGENT_INDEX_URL`` first, then uv's and pip's;
+    2. uv's configured default index (``uv.toml``);
+    3. pip's configured ``index-url`` (``pip.conf``);
+    4. :data:`_DEFAULT_INDEX_URL`.
+
+    Reading the config files (not just env vars) is what makes the check
+    work on the common corporate setup where the mirror lives in
+    ``~/.config/uv/uv.toml`` or ``pip.conf`` rather than an env var — the
+    same place ``uv tool install`` found it.
 
     :returns: The index base URL with any trailing slash stripped, e.g.
         ``"https://pypi.org/simple"``.
@@ -327,10 +341,108 @@ def _resolve_index_url() -> str:
     for var in _INDEX_ENV_VARS:
         value = os.environ.get(var)
         if value:
-            tokens = value.replace(",", " ").split()
-            if tokens:
-                return tokens[0].rstrip("/")
+            url = _first_index_token(value)
+            if url:
+                return url
+    for reader in (_index_from_uv_config, _index_from_pip_config):
+        url = reader()
+        if url:
+            return url
     return _DEFAULT_INDEX_URL
+
+
+def _first_index_token(value: str) -> str:
+    """Return the first (primary) URL from a possibly multi-value index var.
+
+    :param value: An index env var value, e.g.
+        ``"https://a/simple https://b/simple"``.
+    :returns: The first URL with any trailing slash stripped, or ``""``.
+    """
+    tokens = value.replace(",", " ").split()
+    return tokens[0].rstrip("/") if tokens else ""
+
+
+def _user_config_base() -> Path:
+    """Return the XDG user-config dir (``$XDG_CONFIG_HOME`` or ``~/.config``)."""
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    return Path(xdg) if xdg else Path.home() / ".config"
+
+
+def _index_from_uv_config() -> str:
+    """Read uv's configured *default* index from ``uv.toml``, or ``""``.
+
+    Checks the user config (``$XDG_CONFIG_HOME/uv/uv.toml`` or
+    ``~/.config/uv/uv.toml``) then the system config (``/etc/uv/uv.toml``).
+    Honors the legacy ``index-url`` key and a ``[[index]]`` entry marked
+    ``default = true``. A non-default ``[[index]]`` is *supplementary*
+    (PyPI stays the default) and is deliberately ignored, so we never
+    mistake an extra index for the primary one. Best-effort: any read /
+    parse error skips that file.
+
+    :returns: The configured default index URL (trailing slash stripped),
+        or ``""`` when none is set.
+    """
+    import tomllib
+
+    for path in (_user_config_base() / "uv" / "uv.toml", Path("/etc/uv/uv.toml")):
+        try:
+            data = tomllib.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        legacy = data.get("index-url")
+        if isinstance(legacy, str) and legacy.strip():
+            return legacy.strip().rstrip("/")
+        indexes = data.get("index")
+        if isinstance(indexes, list):
+            for entry in indexes:
+                if (
+                    isinstance(entry, dict)
+                    and entry.get("default") is True
+                    and isinstance(entry.get("url"), str)
+                    and entry["url"].strip()
+                ):
+                    return entry["url"].strip().rstrip("/")
+    return ""
+
+
+def _index_from_pip_config() -> str:
+    """Read pip's configured ``index-url`` from ``pip.conf``, or ``""``.
+
+    Checks ``$PIP_CONFIG_FILE``, the user config
+    (``$XDG_CONFIG_HOME/pip/pip.conf`` or ``~/.config/pip/pip.conf``, plus
+    legacy ``~/.pip/pip.conf``) and common system locations — highest
+    precedence first — returning the first ``[global]`` / ``[install]``
+    ``index-url`` found. Interpolation is disabled so URLs containing
+    ``%`` parse cleanly. Best-effort: any read / parse error skips.
+
+    :returns: The configured ``index-url`` (trailing slash stripped), or
+        ``""`` when none is set.
+    """
+    import configparser
+
+    candidates: list[Path] = []
+    env_file = os.environ.get("PIP_CONFIG_FILE")
+    if env_file:
+        candidates.append(Path(env_file))
+    candidates += [
+        _user_config_base() / "pip" / "pip.conf",
+        Path.home() / ".pip" / "pip.conf",
+        Path("/Library/Application Support/pip/pip.conf"),
+        Path("/etc/pip.conf"),
+    ]
+    for path in candidates:
+        parser = configparser.ConfigParser(interpolation=None)
+        try:
+            if not parser.read(path):
+                continue
+        except (configparser.Error, OSError, UnicodeDecodeError):
+            continue
+        for section in ("global", "install"):
+            if parser.has_option(section, "index-url"):
+                url = parser.get(section, "index-url").strip()
+                if url:
+                    return url.rstrip("/")
+    return ""
 
 
 def fetch_latest_version() -> str | None:

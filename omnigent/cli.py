@@ -1263,11 +1263,12 @@ def main() -> None:
 
     setup_cli_logging(argv)
 
-    # ``omnigent setup`` IS the setup wizard — if it fails,
-    # telling the user to "run omnigent setup" would be circular.
-    # Internal-beta and other subcommand-on-setup forms still share
-    # the same first token.
-    suggest_setup = argv[0] != "setup"
+    # ``omnigent setup`` IS the setup wizard — if it fails, telling the
+    # user to "run omnigent setup" would be circular. ``upgrade`` is
+    # excluded too: its failures (unreachable index, dev checkout, install
+    # error) are never about a missing model credential, so the setup hint
+    # would only mislead.
+    suggest_setup = argv[0] not in {"setup", "upgrade"}
 
     # Lightweight update notice: only on an interactive terminal and only
     # for user-facing commands. Reads a cached "latest PyPI version" and

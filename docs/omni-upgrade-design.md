@@ -88,9 +88,12 @@ Most of steps 2/5 reuse helpers that already existed in `update_check.py`.
   notifies only when `latest > current`.
 - **Configured-index aware**: `fetch_latest_version` queries the resolved
   index's Simple Repository API (PEP 691 JSON, PEP 503 HTML fallback), not
-  PyPI's Warehouse-only JSON API. The index comes from `OMNIGENT_INDEX_URL` /
-  `UV_INDEX_URL` / `PIP_INDEX_URL` (default `pypi.org/simple`), so it works on
-  corporate mirrors / air-gapped networks and matches what `omni upgrade` pulls.
+  PyPI's Warehouse-only JSON API. `_resolve_index_url()` checks
+  `OMNIGENT_INDEX_URL` / `UV_INDEX_URL` / `PIP_INDEX_URL`, then the uv/pip
+  **config files** (`uv.toml`'s `index-url` or default `[[index]]`; `pip.conf`'s
+  `[global] index-url`), default `pypi.org/simple`. So it works on corporate
+  mirrors / air-gapped networks even when the mirror lives in a config file
+  (the common case), and matches what `omni upgrade` pulls.
 - **Fire once per release**: the cache tracks `last_notified_version`; the
   notice shows once per new version, never on every invocation.
 - **Never on the hot path**: the foreground only reads the cache (instant). The
@@ -109,7 +112,8 @@ itself (that responsibility moved to the command).
 
 - **Source of truth**: the configured package index's Simple Repository API
   (default `pypi.org/simple`; honors `OMNIGENT_INDEX_URL` / `UV_INDEX_URL` /
-  `PIP_INDEX_URL`). Picks the latest non-pre-release. No GitHub Releases are cut.
+  `PIP_INDEX_URL` and the uv/pip config files). Picks the latest
+  non-pre-release. No GitHub Releases are cut.
 - **Drain posture**: drain-and-wait by default, `--force` to stop now.
 - **Restart**: lazy respawn (no auto-restart) — simplest, fewest surprises.
 - **Notice cadence**: once per new release.
@@ -119,7 +123,8 @@ itself (that responsibility moved to the command).
 - True rolling drain (new server on a new port, old one finishes) — unnecessary
   for a local single-user server.
 - Pre-release / channel opt-in (the probe filters pre-releases today).
-- Parsing uv.toml / pip.conf index URLs (only env vars are read; use
-  `OMNIGENT_INDEX_URL` otherwise).
+- Project-local `uv.toml` / `pyproject [tool.uv]` index URLs (only the user/
+  system uv config and pip.conf are read — matching how `uv tool install`
+  resolves a global tool; use `OMNIGENT_INDEX_URL` for anything else).
 - A `/api/version` drift warning when attaching to a server you didn't spawn.
 - A `config` toggle mirroring `OMNIGENT_NO_UPDATE_CHECK`.
