@@ -285,7 +285,10 @@ def test_stream_responses_decodes_utf8_split_across_chunks() -> None:
 def test_resolve_base_url_override_wins() -> None:
     from omnigent.llms.adapters.openai import _resolve_base_url
 
-    assert _resolve_base_url("https://custom.api/v1/", "https://default.api/v1") == "https://custom.api/v1"
+    assert (
+        _resolve_base_url("https://custom.api/v1/", "https://default.api/v1")
+        == "https://custom.api/v1"
+    )
 
 
 def test_resolve_base_url_falls_back_to_default() -> None:
@@ -504,9 +507,7 @@ def test_parse_responses_event_reasoning_summary_delta() -> None:
     from omnigent.llms.adapters.openai import _parse_responses_event
     from omnigent.llms.types import ResponseReasoningSummaryTextDeltaEvent
 
-    event = _parse_responses_event(
-        "response.reasoning_summary_text.delta", {"delta": "summary"}
-    )
+    event = _parse_responses_event("response.reasoning_summary_text.delta", {"delta": "summary"})
     assert isinstance(event, ResponseReasoningSummaryTextDeltaEvent)
     assert event.delta == "summary"
 
@@ -515,9 +516,7 @@ def test_parse_responses_event_reasoning_started() -> None:
     from omnigent.llms.adapters.openai import _parse_responses_event
     from omnigent.llms.types import ResponseReasoningStartedEvent
 
-    event = _parse_responses_event(
-        "response.output_item.added", {"item": {"type": "reasoning"}}
-    )
+    event = _parse_responses_event("response.output_item.added", {"item": {"type": "reasoning"}})
     assert isinstance(event, ResponseReasoningStartedEvent)
 
 
@@ -577,9 +576,7 @@ def test_parse_responses_event_non_reasoning_item_added_returns_none() -> None:
     """output_item.added for non-reasoning types returns None."""
     from omnigent.llms.adapters.openai import _parse_responses_event
 
-    event = _parse_responses_event(
-        "response.output_item.added", {"item": {"type": "message"}}
-    )
+    event = _parse_responses_event("response.output_item.added", {"item": {"type": "message"}})
     assert event is None
 
 
@@ -587,7 +584,5 @@ def test_parse_responses_event_non_native_item_done_returns_none() -> None:
     """output_item.done for non-native types returns None."""
     from omnigent.llms.adapters.openai import _parse_responses_event
 
-    event = _parse_responses_event(
-        "response.output_item.done", {"item": {"type": "message"}}
-    )
+    event = _parse_responses_event("response.output_item.done", {"item": {"type": "message"}})
     assert event is None

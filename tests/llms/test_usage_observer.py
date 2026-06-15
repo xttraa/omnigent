@@ -452,9 +452,7 @@ def test_concurrent_notifies_do_not_lose_updates(
 # ── notify_from_dict ─────────────────────────────────────────────
 
 
-def test_notify_from_dict_unpacks_usage(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_notify_from_dict_unpacks_usage(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """notify_from_dict unpacks standard keys and delegates to notify."""
     monkeypatch.setenv(_usage_observer._ENV_VAR, str(tmp_path / "tokens.json"))
     _usage_observer.set_current_test("test_from_dict")
@@ -480,7 +478,7 @@ def test_notify_from_dict_none_usage_is_noop(
 def test_notify_from_dict_empty_dict_is_noop(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """notify_from_dict with empty dict is a no-op (all zeros)."""
+    """notify_from_dict({}) resolves to notify(..., 0, 0, 0) — records stay empty."""
     monkeypatch.setenv(_usage_observer._ENV_VAR, str(tmp_path / "tokens.json"))
     _usage_observer.set_current_test("test_empty")
     _usage_observer.notify_from_dict(model="m", usage={})

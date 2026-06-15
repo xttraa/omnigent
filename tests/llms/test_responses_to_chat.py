@@ -710,7 +710,7 @@ def test_extract_delta_content_list_with_output_text_blocks() -> None:
     from omnigent.llms._responses_to_chat import _extract_delta_content
 
     content = [{"type": "output_text", "text": "Hello"}]
-    text, reasoning = _extract_delta_content(content)
+    text, _reasoning = _extract_delta_content(content)
     assert text == "Hello"
 
 
@@ -734,7 +734,7 @@ def test_extract_delta_content_list_with_bare_strings() -> None:
     from omnigent.llms._responses_to_chat import _extract_delta_content
 
     content = ["Hello", " world"]
-    text, reasoning = _extract_delta_content(content)
+    text, _reasoning = _extract_delta_content(content)
     assert text == "Hello world"
 
 
@@ -743,7 +743,7 @@ def test_extract_delta_content_list_skips_non_dict_non_string() -> None:
     from omnigent.llms._responses_to_chat import _extract_delta_content
 
     content = [42, {"type": "text", "text": "ok"}]
-    text, reasoning = _extract_delta_content(content)
+    text, _reasoning = _extract_delta_content(content)
     assert text == "ok"
 
 
@@ -752,7 +752,7 @@ def test_extract_delta_content_reasoning_without_summary() -> None:
     from omnigent.llms._responses_to_chat import _extract_delta_content
 
     content = [{"type": "reasoning"}]
-    text, reasoning = _extract_delta_content(content)
+    _text, reasoning = _extract_delta_content(content)
     assert reasoning == ""
 
 
@@ -774,9 +774,7 @@ def test_extract_usage_returns_none_for_empty_dict() -> None:
 def test_extract_usage_maps_fields() -> None:
     from omnigent.llms._responses_to_chat import _extract_usage
 
-    usage = _extract_usage(
-        {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
-    )
+    usage = _extract_usage({"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
     assert usage is not None
     assert usage.input_tokens == 10
     assert usage.output_tokens == 5
@@ -800,14 +798,10 @@ async def test_streaming_usage_only_chunk() -> None:
             }
         },
     ]
-    events = [
-        e async for e in chat_stream_to_response_events(_aiter(chunks), model="test")
-    ]
+    events = [e async for e in chat_stream_to_response_events(_aiter(chunks), model="test")]
     completed = events[-1]
     assert isinstance(completed, ResponseCompletedEvent)
-    assert completed.response.usage == Usage(
-        input_tokens=10, output_tokens=2, total_tokens=12
-    )
+    assert completed.response.usage == Usage(input_tokens=10, output_tokens=2, total_tokens=12)
 
 
 # ── Trailing tool calls flushed ────────────────────────────────────
