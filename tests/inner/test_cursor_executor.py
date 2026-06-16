@@ -217,6 +217,36 @@ def test_sdk_message_to_events_unwraps_cursor_custom_tool_envelope() -> None:
     assert events[0].args == {"session": "s1", "message": "go"}
 
 
+def test_sdk_message_to_events_unwraps_envelope_on_completion_and_error() -> None:
+    # The same mcp envelope (name == "mcp", real tool nested in args) also arrives
+    # on the completed/error branch. The unwrap must apply there too so the
+    # ToolCallComplete carries the real tool name (not "mcp") — otherwise any
+    # name-keyed request<->complete correlation in policy/UI would break.
+    def _envelope(status: str, result: Any) -> SimpleNamespace:
+        return SimpleNamespace(
+            type="tool_call",
+            name="mcp",
+            call_id="c1",
+            status=status,
+            args={
+                "providerIdentifier": "custom-user-tools",
+                "toolName": "sys_session_send",
+                "args": {"session": "s1"},
+            },
+            result=result,
+        )
+
+    done = _sdk_message_to_events(_envelope("completed", [{"type": "text", "text": "ok"}]))
+    assert isinstance(done[0], ToolCallComplete)
+    assert done[0].name == "sys_session_send"  # unwrapped, not "mcp"
+    assert done[0].metadata == {"call_id": "c1"}
+
+    err = _sdk_message_to_events(_envelope("error", "boom"))
+    assert isinstance(err[0], ToolCallComplete)
+    assert err[0].name == "sys_session_send"
+    assert err[0].status == ToolCallStatus.ERROR
+
+
 def test_build_cursor_prompt_prepends_system_then_drops_it() -> None:
     msgs = [_user("hello")]
     first = _build_cursor_prompt(msgs, is_first_turn=True, system_prompt="SYS")
