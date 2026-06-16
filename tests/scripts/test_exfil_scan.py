@@ -57,7 +57,9 @@ def test_benign_diff_is_clean(tmp_path: Path) -> None:
     Guards against the scan blocking ordinary contributions. Asserts exit 0 and
     no error annotation for an unremarkable new test file.
     """
-    proc = _run(tmp_path, _diff("tests/test_math.py", ["def test_add():", "    assert 1 + 1 == 2"]))
+    proc = _run(
+        tmp_path, _diff("tests/test_math.py", ["def test_add():", "    assert 1 + 1 == 2"])
+    )
     assert proc.returncode == 0, proc.stdout
     assert "::error" not in proc.stdout
 
