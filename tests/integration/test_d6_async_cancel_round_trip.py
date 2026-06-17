@@ -232,6 +232,11 @@ def test_client_tool_round_trip(
         f"D6 round-trip should complete cleanly; turn ended {status!r} "
         f"with text {''.join(text_chunks)!r}"
     )
+    final_text = "".join(text_chunks)
+    assert marker in final_text, (
+        f"D6 round-trip final answer should echo the tool-output marker; "
+        f"expected {marker!r} in reply text {final_text!r}"
+    )
 
 
 def test_direct_cancel_parks_then_interrupts_cleanly(
