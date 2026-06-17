@@ -87,7 +87,7 @@ def example_yaml_path(repo_root: Path, name: str) -> Path:
     2. ``tests/resources/examples/<name>.yaml`` — single-YAML demos
        moved to the test-resources tree.
     3. ``tests/resources/examples/<name>/`` — multi-file AGENTSPEC
-       demos (``archer``, ``coder``, ``openai-coder``).
+       demos (``coder``, ``openai-coder``).
     4. ``tests/resources/agents/<name>/`` — test-only fixtures
        (aspirational specs, incremental-feature variants).
 
@@ -95,7 +95,7 @@ def example_yaml_path(repo_root: Path, name: str) -> Path:
         ``omnigent_repo_root`` fixture value.
     :param name: Agent name. For top-level YAMLs, the filename
         stem (``"hello_world"`` → ``tests/resources/examples/hello_world.yaml``);
-        for dir-shaped agents, the directory name (``"archer"``).
+        for dir-shaped agents, the directory name.
     :returns: Absolute :class:`Path` to the YAML / config file.
     :raises FileNotFoundError: When none of the layouts match in
         any of the roots.

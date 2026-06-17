@@ -67,7 +67,6 @@ def _skip_when_harness_cli_missing(request: pytest.FixtureRequest) -> None:
 # Agent bundle directories relative to repo root.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _CODER_DIR = _REPO_ROOT / "tests" / "resources" / "examples" / "coder"
-_ARCHER_DIR = _REPO_ROOT / "tests" / "resources" / "examples" / "archer"
 
 # OpenAI model name -> nearest-equivalent Databricks foundation-model
 # name. Intentionally lossy (e.g. ``gpt-4o`` and ``openai/gpt-4o`` both
@@ -756,22 +755,6 @@ def coder_agent(http_client: httpx.Client, databricks_workspace_host: str | None
     return upload_agent(
         http_client,
         _CODER_DIR,
-        rewrite_model_for_databricks=databricks_workspace_host is not None,
-    )
-
-
-@pytest.fixture(scope="session")
-def archer_agent(http_client: httpx.Client, databricks_workspace_host: str | None) -> str:
-    """
-    Upload the archer agent (with fact_checker and summarizer
-    sub-agents) and return its name.
-
-    :param http_client: HTTP client pointed at the server.
-    :returns: The agent name, e.g. ``"archer"``.
-    """
-    return upload_agent(
-        http_client,
-        _ARCHER_DIR,
         rewrite_model_for_databricks=databricks_workspace_host is not None,
     )
 
