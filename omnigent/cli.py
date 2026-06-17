@@ -4307,9 +4307,8 @@ def resume(
 # ``omnigent.chat.run_chat`` for how local-agent options get baked
 # into a materialized copy of the spec before the server starts.
 _HARNESS_CHOICES_HELP = (
-    "'claude' (alias for 'claude-sdk'), 'claude-sdk', 'codex', "
-    "'cursor', "
-    "'openai-agents', 'open-responses', or 'pi'"
+    "'antigravity', 'claude' (alias for 'claude-sdk'), 'claude-sdk', "
+    "'codex', 'cursor', 'openai-agents', 'open-responses', or 'pi'"
 )
 _HARNESS_HELP = f"Harness to use for a local agent: {_HARNESS_CHOICES_HELP}."
 _RUN_HARNESS_HELP = (
@@ -4331,6 +4330,10 @@ _LOG_HELP = "Write a JSON dump of the conversation to ~/.omnigent/logs/ on exit.
 
 
 _DEFAULT_HARNESS_PROMPTS = {
+    "antigravity": (
+        "You are Antigravity, running through Omnigent. "
+        "Help the user with software engineering tasks."
+    ),
     "claude-sdk": (
         "You are Claude Code, running through Omnigent. "
         "Help the user with software engineering tasks."
