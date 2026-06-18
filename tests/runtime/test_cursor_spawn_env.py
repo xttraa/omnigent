@@ -220,6 +220,34 @@ def test_databricks_auth_does_not_adopt_stored_cursor_key(
     assert "HARNESS_CURSOR_API_KEY" not in env
 
 
+def test_empty_stored_env_key_is_omitted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A configured ``env:CURSOR_API_KEY`` ref pointing at an EMPTY var is omitted.
+
+    ``resolve_secret``'s ``env:`` branch only raises on an *unset* variable, so
+    an exported-but-empty ``CURSOR_API_KEY=""`` resolves to ``""`` — which the
+    cursor layer folds to ``None``. The builder must therefore write no
+    ``HARNESS_CURSOR_API_KEY`` (the ambient fallback reads the same empty var
+    and is also skipped), agreeing with ``cursor_api_key_configured() is False``
+    rather than forwarding a blank credential.
+    """
+    monkeypatch.setenv("CURSOR_API_KEY", "")
+    _write_cursor_config(tmp_path, "env:CURSOR_API_KEY")
+    env = _build_cursor_spawn_env(_make_spec(auth=None))
+    assert "HARNESS_CURSOR_API_KEY" not in env
+
+
+def test_whitespace_only_stored_env_key_is_omitted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A configured ``env:`` ref pointing at an all-whitespace var is omitted."""
+    monkeypatch.setenv("CURSOR_API_KEY", "   \n\t  ")
+    _write_cursor_config(tmp_path, "env:CURSOR_API_KEY")
+    env = _build_cursor_spawn_env(_make_spec(auth=None))
+    assert "HARNESS_CURSOR_API_KEY" not in env
+
+
 def test_unresolvable_stored_key_is_omitted(tmp_path: Path) -> None:
     """A dangling stored reference resolves softly to no env var.
 
