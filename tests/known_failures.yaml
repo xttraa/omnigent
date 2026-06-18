@@ -65,19 +65,8 @@ skips:
     issue: 532
     cluster: files-uploads-attachments
     mode: skip
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_refusal_shows_deny_sentinel
-    reason: "Pexpect timeout waiting for 'approval required' regex. Same REPL-pexpect timeout family as the earlier test_repl_* entries."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
 
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_tool_call_approval_allows_tool_to_run
-    reason: "Same REPL approval pexpect-timeout family."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
-
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_label_driven_ask_refuse_shows_sentinel
     reason: "Same REPL approval pexpect-timeout family."
     issue: 532
     cluster: repl-pexpect-cli
@@ -170,18 +159,6 @@ skips:
     cluster: run-ap-examples-harness
     mode: skip
 
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_approve_always_caches_for_later_turns
-    reason: "Shard 1 bulk: REPL approval pexpect-timeout family."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
-
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_label_driven_ask_approves
-    reason: "Shard 1 bulk: REPL approval pexpect-timeout family."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
-
   - id: tests/e2e/test_repl_approval_e2e.py::test_repl_tool_result_ask_refuse_replaces_output
     reason: "Shard 1 bulk: REPL approval pexpect-timeout family."
     issue: 532
@@ -221,18 +198,6 @@ skips:
 
   - id: tests/e2e/omnigent/test_run_omnigent_rate_limit_approval.py::test_run_omnigent_rate_limit_approval_round_trip
     reason: "Shard 3 bulk: pexpect timeout waiting for 'approval required'; hung the whole pytest process under single-worker thread-timeout."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
-
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_single_approval_allows_llm_response
-    reason: "Shard 3 bulk: REPL approval pexpect family."
-    issue: 532
-    cluster: repl-pexpect-cli
-    mode: skip
-
-  - id: tests/e2e/test_repl_approval_e2e.py::test_repl_two_turns_fires_one_approval_per_turn
-    reason: "Shard 3 bulk: REPL approval pexpect family."
     issue: 532
     cluster: repl-pexpect-cli
     mode: skip
