@@ -268,6 +268,34 @@ def get_model_context_window(model: str) -> int:
     return _fetch_context_window_from_mlflow(model) or _DEFAULT_CONTEXT_WINDOW
 
 
+def resolve_effective_context_window(
+    spec_context_window: int | None, model: str | None
+) -> int | None:
+    """
+    Resolve the context window to use for compaction budgeting.
+
+    Prefers an explicit, spec-declared window (``executor.context_window``)
+    over the model-catalog lookup. An agent author who declares a window is
+    stating the size the model actually serves for this agent (e.g. a 1M
+    Claude window); the catalog lookup falls back to a conservative 128K
+    default for models it can't resolve, which would otherwise compact far
+    too early. Mirrors what the server already does for its display ring
+    (``server/routes/sessions.py``).
+
+    :param spec_context_window: ``executor.context_window`` from the spec,
+        or ``None`` when the author declared no explicit window.
+    :param model: The effective model identifier, or ``None``.
+    :returns: The declared window when set; otherwise the model's catalog
+        window via :func:`get_model_context_window`; ``None`` when neither
+        a declared window nor a model is available.
+    """
+    if spec_context_window is not None:
+        return spec_context_window
+    if model:
+        return get_model_context_window(model)
+    return None
+
+
 @dataclass(frozen=True)
 class ModelPricing:
     """

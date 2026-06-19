@@ -4389,6 +4389,36 @@ def get_session_agent_id(session_id: str) -> str | None:
     return _session_agent_ids_ref.get(session_id)
 
 
+def _should_skip_futile_recompaction(
+    provider_tokens: int | None, last_compacted_provider_tokens: int | None
+) -> bool:
+    """
+    Decide whether a provider-reported compaction trigger should be skipped
+    as futile.
+
+    Runner-side compaction rewrites the runner's own persisted history, but it
+    cannot shrink a harness's *own* session context (a resumed ``claude-sdk``
+    turn is sent only the latest user message; the SDK keeps its full context
+    by ``session_id``). So when the provider-reported fill has not dropped
+    since the last compaction, re-firing achieves nothing but cost and churn —
+    the harness must manage its own context (its own auto-compaction). Only the
+    ``provider_tokens`` path can loop this way; tiktoken-driven compaction of
+    the runner's own history genuinely shrinks it, so this guard never applies
+    there (``provider_tokens is None``).
+
+    :param provider_tokens: The current provider-reported context fill, or
+        ``None`` when no provider usage was reported (tiktoken path).
+    :param last_compacted_provider_tokens: The provider fill recorded at the
+        last successful compaction, or ``None`` if we have not compacted on a
+        provider-reported fill yet.
+    :returns: ``True`` when compaction should be skipped because the fill has
+        not decreased since the last compaction.
+    """
+    if provider_tokens is None or last_compacted_provider_tokens is None:
+        return False
+    return provider_tokens >= last_compacted_provider_tokens
+
+
 def create_runner_app(
     *,
     process_manager: HarnessProcessManager | None = None,
@@ -5375,12 +5405,21 @@ def create_runner_app(
 
                 spawn_env = build_cursor_native_spawn_env(session_id)
             _session_spec_cache[session_id] = spec_entry
-            from omnigent.llms.context_window import get_model_context_window
+            from omnigent.llms.context_window import resolve_effective_context_window
             from omnigent.runtime.workflow import _resolve_spec_model
 
             _model = _resolve_spec_model(spec)
+            # Only pre-seed here when the spec pins a concrete model: the
+            # per-turn dispatch path (below) falls back to ``"unknown"`` for
+            # an unpinned model, and a ``None`` model would crash count_tokens.
+            # Either way the dispatch path honors executor.context_window.
             if _model:
-                _ctx_window = get_model_context_window(_model)
+                # Prefer the spec's declared executor.context_window over the
+                # model-catalog lookup so a high-window agent (e.g. a 1M Claude
+                # brain) isn't compacted against the 128K catalog default.
+                _ctx_window = resolve_effective_context_window(
+                    spec.executor.context_window, _model
+                )
                 if _ctx_window is not None:
                     _compaction_contexts[session_id] = {
                         "context_window": _ctx_window,
@@ -6299,6 +6338,8 @@ def create_runner_app(
         conv: str,
         cc: dict[str, Any],
         spec: Any | None,
+        *,
+        force: bool = False,
     ) -> None:
         """
         Run proactive compaction if the history exceeds the token budget.
@@ -6345,6 +6386,26 @@ def create_runner_app(
             provider_tokens,
         )
         if estimated <= budget:
+            # Back under budget — re-arm the futile-recompaction guard so a
+            # later genuine growth past budget can compact again.
+            cc.pop("last_compacted_provider_tokens", None)
+            return
+
+        # Don't re-fire on a provider-reported fill that hasn't dropped since
+        # the last compaction: runner-side compaction can't shrink a harness's
+        # own session context, so it would loop every turn. Defer to the
+        # harness's own auto-compaction instead. ``force`` (the reactive
+        # _ContextWindowOverflow path) bypasses this — a confirmed overflow
+        # must always attempt compaction.
+        _last_compacted = cc.get("last_compacted_provider_tokens")
+        if not force and _should_skip_futile_recompaction(provider_tokens, _last_compacted):
+            _logger.info(
+                "Skipping futile re-compaction: conv=%s provider fill %s did not "
+                "drop below last-compacted %s; deferring to harness auto-compaction",
+                conv,
+                provider_tokens,
+                _last_compacted,
+            )
             return
 
         _logger.info(
@@ -6401,6 +6462,13 @@ def create_runner_app(
                 connection=connection,
             )
             _session_histories[conv] = result.messages
+            # Record the provider fill that triggered this compaction so the
+            # next provider-reported turn can detect a futile re-fire (fill
+            # that did not drop because the harness owns its own context).
+            # Persists across the provider_tokens pop below. Only meaningful on
+            # the provider path; None on the tiktoken path.
+            if provider_tokens is not None:
+                cc["last_compacted_provider_tokens"] = provider_tokens
             # Invalidate stale provider tokens — the context was
             # just compacted so the old value no longer reflects
             # reality.  The next response.completed will set a
@@ -9026,18 +9094,24 @@ def create_runner_app(
             _session_histories[conv] = await _load_history_as_input(conv)
 
         if conv not in _compaction_contexts:
-            from omnigent.llms.context_window import get_model_context_window
+            from omnigent.llms.context_window import resolve_effective_context_window
 
             _model: str | None = None
+            _spec_ctx_window: int | None = None
             _compaction_cfg = None
             if cached_spec is not None:
                 from omnigent.runtime.workflow import _resolve_spec_model
 
                 _model = _resolve_spec_model(cached_spec)
+                _spec_ctx_window = cached_spec.executor.context_window
                 _compaction_cfg = cached_spec.compaction
             if not _model:
                 _model = msg_body.get("model") or "unknown"
-            _ctx_window = get_model_context_window(_model)
+            # Prefer the spec's declared executor.context_window over the
+            # model-catalog lookup (see resolve_effective_context_window):
+            # keeps a high-window agent from compacting against the 128K
+            # catalog default.
+            _ctx_window = resolve_effective_context_window(_spec_ctx_window, _model)
             if _ctx_window is not None:
                 _compaction_contexts[conv] = {
                     "context_window": _ctx_window,
@@ -9254,7 +9328,9 @@ def create_runner_app(
             else:
                 _cc["context_window"] = overflow.max_tokens
 
-            await _proactive_compact_if_needed(conv, _cc, cached_spec)
+            # force=True: a confirmed context overflow must always attempt
+            # compaction, bypassing the futile-recompaction guard.
+            await _proactive_compact_if_needed(conv, _cc, cached_spec, force=True)
 
             # The compacted history replaces the body's content wholesale,
             # which would silently drop the per-turn advisor note — re-merge
