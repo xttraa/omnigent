@@ -99,9 +99,14 @@ def test_compaction_fires_and_agent_retains_context(
     data_dir.mkdir()
 
     env = dict(omnigent_credentials_env)
-    # Tiny context window so the compaction budget (0.8 * window) is a
-    # couple hundred tokens and one verbose turn's history exceeds it.
-    env["AP_CONTEXT_WINDOW_OVERRIDE"] = "256"
+    # Tiny context window so the compaction budget (0.8 * window ≈ 51
+    # tokens) is exceeded by the very first turn's history — even the
+    # user prompt alone is ~75 tokens. A larger budget (the old 256 →
+    # 204) made firing depend on how verbose the model happened to be
+    # that run, which flaked ~40% of CI attempts. This is a runner-side
+    # budget knob only; it does not cap the harness API call, so the
+    # model still produces full replies for the context-retention check.
+    env["AP_CONTEXT_WINDOW_OVERRIDE"] = "64"
     env["OMNIGENT_DATA_DIR"] = str(data_dir)
 
     child = spawn_omnigent_run(
