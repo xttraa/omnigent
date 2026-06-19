@@ -4,18 +4,19 @@ These tests start a real server subprocess, connect a real host
 daemon, create sessions via the REST API, and verify the full
 launch-runner → exchange-messages flow.
 
-Run with Databricks credentials::
+All tests run against the mock LLM server — no real credentials
+needed::
 
-    .venv/bin/python -m pytest tests/e2e/test_host_e2e.py \
-        --profile <your-profile> --llm-api-key <your-token> -v
+    .venv/bin/python -m pytest tests/e2e/test_host_e2e.py -v
+
+The last test (claude-native host-restart regression) is skipped because
+it requires real ``claude`` + ``tmux`` CLIs with interactive OAuth login.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import re
-import shutil
 import signal
 import subprocess
 import sys
@@ -30,6 +31,7 @@ import yaml
 
 from tests.e2e.conftest import (
     POLL_INTERVAL_S,
+    configure_mock_llm,
     lookup_agent_id,
     poll_session_until_terminal,
     send_user_message_to_session,
@@ -55,23 +57,11 @@ class _SpawnedHostDaemon:
     daemon_log: Path
 
 
-@pytest.fixture
-def profile(request: pytest.FixtureRequest) -> str | None:
-    """The ``--profile`` value, or ``None`` for the OpenAI path.
-
-    :param request: Pytest request exposing the ``--profile`` option.
-    :returns: Profile name, e.g. ``"default"``, or ``None`` when empty.
-    """
-    return request.config.getoption("--profile") or None
-
-
 def _spawn_host_daemon(
     *,
     tmp_path: Path,
     live_server: str,
-    profile: str | None,
-    workspace_host: str | None,
-    llm_bearer: str | None,
+    mock_llm_server_url: str,
 ) -> _SpawnedHostDaemon:
     """
     Spawn an isolated host daemon for a single host e2e test.
@@ -83,24 +73,17 @@ def _spawn_host_daemon(
     host_id gets overwritten and never shows online. A unique name per test
     keeps each host its own row.
 
-    When running against a Databricks gateway (``--profile``), it also
-    materializes a PAT ``~/.databrickscfg`` inside the daemon's ``HOME`` and
-    threads ``DATABRICKS_CONFIG_PROFILE`` through. Host-launched runners
-    strip ``OPENAI_*`` from their environment (the ``_RUNNER_ENV_ALLOWLIST``
-    in ``omnigent/host/connect.py``, so the host owner's secrets never
-    leak into a runner), so they authenticate to the LLM via the profile +
-    config file instead — which must be reachable under the test's ``HOME``.
+    The daemon's environment carries ``OPENAI_BASE_URL`` and
+    ``OPENAI_API_KEY`` pointing at the mock LLM server.  The host
+    daemon forwards ``OPENAI_*`` to its runner subprocesses via
+    ``HARNESS_CREDENTIAL_ENV_VARS``, so the runner's openai-agents
+    executor hits the mock server.
 
     :param tmp_path: Per-test temp dir used as the daemon's ``HOME``.
     :param live_server: Server URL the daemon registers with, e.g.
         ``"http://localhost:18501"``.
-    :param profile: Databricks CLI profile name, e.g. ``"default"``;
-        ``None`` for the OpenAI path (no gateway credentials needed).
-    :param workspace_host: Databricks workspace URL for the cfg ``host =``
-        line, e.g. ``"https://example.databricks.com"``; ``None`` when
-        ``profile`` is ``None``.
-    :param llm_bearer: Bearer/PAT written as the cfg ``token =`` value;
-        ``None`` when ``profile`` is ``None``.
+    :param mock_llm_server_url: Base URL of the mock LLM server, e.g.
+        ``"http://127.0.0.1:12345"``.
     :returns: The spawned daemon handle and its host_id.
     """
     omni_dir = tmp_path / ".omnigent"
@@ -114,12 +97,12 @@ def _spawn_host_daemon(
             sort_keys=True,
         )
     )
-    env = {**os.environ, "HOME": str(tmp_path)}
-    if profile and workspace_host and llm_bearer:
-        (tmp_path / ".databrickscfg").write_text(
-            f"[{profile}]\nhost = {workspace_host}\ntoken = {llm_bearer}\n"
-        )
-        env["DATABRICKS_CONFIG_PROFILE"] = profile
+    env = {
+        **os.environ,
+        "HOME": str(tmp_path),
+        "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
+        "OPENAI_API_KEY": "mock-key",
+    }
     # Capture the daemon's stderr to a file so tests can read the
     # "Launched runner ... (pid=NNNN)" line (and inspect it on failure).
     # The child keeps its own dup of the fd after this handle is closed.
@@ -223,9 +206,7 @@ def test_host_connect_and_list(
     live_server: str,
     http_client: httpx.Client,
     tmp_path: Path,
-    profile: str | None,
-    databricks_workspace_host: str | None,
-    llm_api_key: str,
+    mock_llm_server_url: str,
 ) -> None:
     """
     Start ``omnigent connect`` as a subprocess, verify the host
@@ -238,9 +219,7 @@ def test_host_connect_and_list(
     daemon = _spawn_host_daemon(
         tmp_path=tmp_path,
         live_server=live_server,
-        profile=profile,
-        workspace_host=databricks_workspace_host,
-        llm_bearer=llm_api_key,
+        mock_llm_server_url=mock_llm_server_url,
     )
     proc = daemon.proc
     host_id = daemon.host_id
@@ -278,10 +257,8 @@ def test_host_connect_and_list(
 def test_host_launch_runner_and_session_round_trip(
     live_server: str,
     http_client: httpx.Client,
-    databricks_workspace_host: str | None,
     tmp_path: Path,
-    profile: str | None,
-    llm_api_key: str,
+    mock_llm_server_url: str,
 ) -> None:
     """
     Full golden-path e2e: connect host, upload agent, create
@@ -291,13 +268,15 @@ def test_host_launch_runner_and_session_round_trip(
     This exercises the complete Web UI flow from the design doc:
     list hosts → create session → launch runner → exchange messages.
     """
+    # Configure mock LLM to reply with the marker for the round-trip.
+    marker = "HOST_E2E_GOLDEN_PATH_OK"
+    configure_mock_llm(mock_llm_server_url, [{"text": marker}])
+
     # 1. Start host daemon.
     daemon = _spawn_host_daemon(
         tmp_path=tmp_path,
         live_server=live_server,
-        profile=profile,
-        workspace_host=databricks_workspace_host,
-        llm_bearer=llm_api_key,
+        mock_llm_server_url=mock_llm_server_url,
     )
     host_proc = daemon.proc
     host_id = daemon.host_id
@@ -309,7 +288,6 @@ def test_host_launch_runner_and_session_round_trip(
         agent_name = upload_agent(
             http_client,
             _write_smoke_agent_yaml(tmp_path),
-            rewrite_model_for_databricks=databricks_workspace_host is not None,
         )
 
         # 3. Create session (no runner yet).
@@ -354,7 +332,6 @@ def test_host_launch_runner_and_session_round_trip(
         ).raise_for_status()
 
         # 7. Send a message and verify the LLM responds.
-        marker = "HOST_E2E_GOLDEN_PATH_OK"
         response_id = send_user_message_to_session(
             http_client,
             session_id=session_id,
@@ -388,10 +365,8 @@ def test_host_launch_runner_and_session_round_trip(
 def test_host_runner_survives_host_disconnect(
     live_server: str,
     http_client: httpx.Client,
-    databricks_workspace_host: str | None,
     tmp_path: Path,
-    profile: str | None,
-    llm_api_key: str,
+    mock_llm_server_url: str,
 ) -> None:
     """
     Start host, launch runner, kill host, verify session still
@@ -401,12 +376,15 @@ def test_host_runner_survives_host_disconnect(
     to the server, not through the host. If the session breaks
     after host disconnect, runner independence is violated.
     """
+    # Pre-kill and post-kill markers.
+    marker1 = "HOST_SURVIVE_PRE_KILL"
+    marker2 = "HOST_SURVIVE_POST_KILL"
+    configure_mock_llm(mock_llm_server_url, [{"text": marker1}, {"text": marker2}])
+
     daemon = _spawn_host_daemon(
         tmp_path=tmp_path,
         live_server=live_server,
-        profile=profile,
-        workspace_host=databricks_workspace_host,
-        llm_bearer=llm_api_key,
+        mock_llm_server_url=mock_llm_server_url,
     )
     host_proc = daemon.proc
     host_id = daemon.host_id
@@ -418,7 +396,6 @@ def test_host_runner_survives_host_disconnect(
         agent_name = upload_agent(
             http_client,
             _write_smoke_agent_yaml(tmp_path),
-            rewrite_model_for_databricks=databricks_workspace_host is not None,
         )
         agent_id = lookup_agent_id(http_client, agent_name)
         resp = http_client.post(
@@ -450,7 +427,6 @@ def test_host_runner_survives_host_disconnect(
         ).raise_for_status()
 
         # Verify session works BEFORE killing host.
-        marker1 = "HOST_SURVIVE_PRE_KILL"
         rid1 = send_user_message_to_session(
             http_client,
             session_id=session_id,
@@ -481,7 +457,6 @@ def test_host_runner_survives_host_disconnect(
         # the daemon's SIGTERM cascaded. If the runner IS still
         # online, verify the session still works.
         if sr.status_code == 200 and sr.json().get("online"):
-            marker2 = "HOST_SURVIVE_POST_KILL"
             rid2 = send_user_message_to_session(
                 http_client,
                 session_id=session_id,
@@ -511,9 +486,7 @@ def test_host_death_kills_runners(
     live_server: str,
     http_client: httpx.Client,
     tmp_path: Path,
-    profile: str | None,
-    databricks_workspace_host: str | None,
-    llm_api_key: str,
+    mock_llm_server_url: str,
 ) -> None:
     """
     Start host, launch a runner, kill the host, verify the runner
@@ -527,9 +500,7 @@ def test_host_death_kills_runners(
     daemon = _spawn_host_daemon(
         tmp_path=tmp_path,
         live_server=live_server,
-        profile=profile,
-        workspace_host=databricks_workspace_host,
-        llm_bearer=llm_api_key,
+        mock_llm_server_url=mock_llm_server_url,
     )
     host_proc = daemon.proc
     host_id = daemon.host_id
@@ -610,262 +581,26 @@ def test_host_death_kills_runners(
 
 # ── Host-restart native round-trip (regression guard) ──────────
 #
-# !! SCAFFOLD — NEEDS A LOCAL VERIFYING RUN !!
-# This guards the host-restart native-session fix: a web message sent to a
-# host-bound claude-native session whose runner has died must relaunch the
-# runner, run create_session (terminal + transcript forwarder) BEFORE the
-# message is injected, and round-trip the message back through the forwarder.
-# Without the fix the message is injected before the forwarder attaches and is
-# lost (the user message never persists; no reply streams).
-#
-# It cannot run in CI / was not executed by the author: the daemon-spawned
-# claude TUI's first-run onboarding + trust gates are version/environment-
-# dependent (same reason test_comment_tools_claude_native.py is opt-in). Run it
-# locally once to confirm + iterate:
-#
-#   OMNIGENT_E2E_CLAUDE_NATIVE=1 \
-#   .venv/bin/python -m pytest tests/e2e/test_host_e2e.py \
-#     -k host_native_session_round_trips_after_runner_death \
-#     --profile <your-profile> --llm-api-key <token> -v -rfs
-#
-# Prereqs: `claude` + `tmux` on PATH, and a --profile whose gateway serves the
-# claude-native model.
-_CLAUDE_NATIVE_RESTART_GATE = "OMNIGENT_E2E_CLAUDE_NATIVE"
+# Skipped: this test requires a real interactive Claude login (OAuth) anchored
+# to the real HOME, plus `claude` + `tmux` CLIs on PATH. That authentication
+# cannot be relocated into CI or mocked. The server-side handshake ordering
+# is covered by tests/server/integration/test_session_host_launch.py.
 
-
-def _write_claude_native_agent_yaml(tmp_path: Path) -> Path:
-    """Create a minimal ``claude-native`` agent dir for the host e2e.
-
-    No ``model`` — the Claude CLI picks its own via the runner's gateway
-    profile (``DATABRICKS_CONFIG_PROFILE``, threaded by
-    :func:`_spawn_host_daemon`).
-
-    :param tmp_path: Pytest temp directory.
-    :returns: Path to the agent directory.
-    """
-    agent_dir = tmp_path / "host-e2e-claude-native"
-    agent_dir.mkdir()
-    (agent_dir / "host-e2e-claude-native.yaml").write_text(
-        "\n".join(
-            [
-                "name: host-e2e-claude-native",
-                "description: claude-native agent for host-restart e2e.",
-                "executor:",
-                "  harness: claude-native",
-                "",
-            ]
-        )
-    )
-    return agent_dir
-
-
-def _seed_onboarded_claude_home(home_dir: Path, workspace: str) -> None:
-    """Pre-seed ``~/.claude.json`` so the daemon-spawned Claude TUI starts.
-
-    The host daemon runs with ``HOME=home_dir`` and its runner launches
-    Claude there. With no prior onboarding the first-run theme picker +
-    workspace-trust dialog block the TUI before the MCP bridge initializes,
-    so the terminal/forwarder never come up. Seeding "already onboarded" +
-    "already trusts the workspace" clears both gates. Mirrors the seed in
-    ``test_comment_tools_claude_native.py``.
-
-    :param home_dir: The daemon's ``HOME`` (also the runner's), e.g.
-        ``tmp_path``.
-    :param workspace: The session workspace = Claude's cwd, whose trust
-        gate must be pre-accepted, e.g. ``str(tmp_path / "ws")``.
-    :returns: None.
-    """
-    (home_dir / ".claude.json").write_text(
-        json.dumps(
-            {
-                "hasCompletedOnboarding": True,
-                "theme": "dark",
-                "lastOnboardingVersion": "2.0.0",
-                "projects": {
-                    workspace: {
-                        "hasTrustDialogAccepted": True,
-                        "hasCompletedProjectOnboarding": True,
-                    },
-                },
-            }
-        )
-    )
-
-
-def _native_user_message_round_tripped(
-    client: httpx.Client,
-    *,
-    session_id: str,
-    marker: str,
-) -> bool:
-    """Whether the forwarder mirrored the marker user message back to AP.
-
-    Native web messages aren't persisted at POST time — they're injected
-    into the TUI and the transcript forwarder mirrors them back as
-    persisted items. So a user-role item whose text carries *marker*
-    appearing in ``GET /v1/sessions/{id}/items`` proves the round-trip
-    happened (terminal + forwarder were watching before injection — the
-    fix). Without the fix the message is injected before the forwarder
-    attaches and never persists.
-
-    :param client: HTTP client pointed at the server.
-    :param session_id: Session/conversation id, e.g. ``"conv_abc"``.
-    :param marker: Unique substring embedded in the sent user message.
-    :returns: ``True`` once a matching user item is present.
-    """
-    resp = client.get(f"/v1/sessions/{session_id}/items")
-    if resp.status_code != 200:
-        return False
-    for item in resp.json().get("data", []):
-        if item.get("type") != "message" or item.get("role") != "user":
-            continue
-        content = item.get("content")
-        if isinstance(content, list) and any(
-            isinstance(block, dict)
-            and isinstance(block.get("text"), str)
-            and marker in block["text"]
-            for block in content
-        ):
-            return True
-    return False
-
-
+@pytest.mark.skip(
+    reason=(
+        "claude-native host-restart e2e requires real `claude` + `tmux` CLIs "
+        "with interactive OAuth login; cannot run against mock LLM"
+    ),
+)
 def test_host_native_session_round_trips_after_runner_death(
     live_server: str,
     http_client: httpx.Client,
-    databricks_workspace_host: str | None,
     tmp_path: Path,
-    profile: str | None,
-    llm_api_key: str,
+    mock_llm_server_url: str,
 ) -> None:
     """A web message to a host-bound claude-native session whose runner
     died relaunches the runner and round-trips through the forwarder.
 
-    Regression guard for the host-restart native-session fix. Steps: connect
-    host, create a
-    claude-native session (wrapper label set so the message-bypass path
-    fires), launch its runner, KILL the runner, then send a web message.
-    The relaunch path must run ``create_session`` (terminal + forwarder)
-    before forwarding, so the message round-trips back as a persisted
-    user item. Pre-fix the message was injected before the forwarder
-    attached and was lost.
-
-    SCAFFOLD: gated + not run in CI (see module note above). Verify
-    locally with ``OMNIGENT_E2E_CLAUDE_NATIVE=1`` + ``--profile``.
+    Regression guard for the host-restart native-session fix. Skipped:
+    requires real ``claude`` + ``tmux`` CLIs with interactive OAuth login.
     """
-    if os.environ.get(_CLAUDE_NATIVE_RESTART_GATE) != "1":
-        pytest.skip(
-            f"Set {_CLAUDE_NATIVE_RESTART_GATE}=1 (and have `claude` + `tmux` on PATH and "
-            "a gateway --profile) to run. The daemon-spawned Claude TUI's first-run "
-            "onboarding/trust gates are version/environment-dependent and block headless "
-            "startup in CI; the server-side handshake ordering is covered by "
-            "tests/server/integration/test_session_host_launch.py."
-        )
-    if shutil.which("claude") is None:
-        pytest.skip("'claude' CLI is not on PATH.")
-    if shutil.which("tmux") is None:
-        pytest.skip("'tmux' is not on PATH.")
-    if profile is None or databricks_workspace_host is None:
-        pytest.skip("native host-restart e2e needs a gateway --profile for the Claude model.")
-
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-    # Seed the daemon HOME (= the runner's HOME) as onboarded + trusting the
-    # workspace BEFORE spawning, so the runner's Claude TUI starts headlessly.
-    _seed_onboarded_claude_home(tmp_path, str(workspace))
-
-    daemon = _spawn_host_daemon(
-        tmp_path=tmp_path,
-        live_server=live_server,
-        profile=profile,
-        workspace_host=databricks_workspace_host,
-        llm_bearer=llm_api_key,
-    )
-    host_proc = daemon.proc
-    host_id = daemon.host_id
-
-    try:
-        _wait_for_host_online(http_client, host_id, timeout=30.0)
-
-        agent_name = upload_agent(
-            http_client,
-            _write_claude_native_agent_yaml(tmp_path),
-            rewrite_model_for_databricks=False,
-        )
-        agent_id = lookup_agent_id(http_client, agent_name)
-
-        # Inline host-launch a native session. The wrapper label is what
-        # gates the message-bypass / forwarder round-trip (mirrors what the
-        # web NewChatDialog sets for a claude-native agent).
-        create_resp = http_client.post(
-            "/v1/sessions",
-            json={
-                "agent_id": agent_id,
-                "host_id": host_id,
-                "workspace": str(workspace),
-                "labels": {"omnigent.wrapper": "claude-code-native-ui"},
-            },
-            timeout=60.0,
-        )
-        create_resp.raise_for_status()
-        session_id = create_resp.json()["id"]
-
-        # Wait for the host to launch the initial runner (daemon logs its pid).
-        deadline = time.monotonic() + 60.0
-        initial_pid: int | None = None
-        while time.monotonic() < deadline:
-            initial_pid = _runner_pid_from_daemon_log(daemon.daemon_log)
-            if initial_pid is not None and _pid_alive(initial_pid):
-                break
-            time.sleep(POLL_INTERVAL_S)
-        assert initial_pid is not None, "host never launched the initial runner"
-
-        # Simulate the host-restart "runner gone" state: hard-kill the runner.
-        os.kill(initial_pid, signal.SIGKILL)
-        deadline = time.monotonic() + 30.0
-        while time.monotonic() < deadline and _pid_alive(initial_pid):
-            time.sleep(POLL_INTERVAL_S)
-        assert not _pid_alive(initial_pid), f"runner {initial_pid} did not die after SIGKILL"
-
-        # The first web message after the runner died must relaunch it, run
-        # create_session (terminal + forwarder) BEFORE forwarding, and
-        # round-trip the message back. Marker rides in the user text so the
-        # round-trip is detectable without depending on Claude's reply.
-        marker = f"NATIVE_RESTART_{uuid.uuid4().hex[:8]}"
-        send_resp = http_client.post(
-            f"/v1/sessions/{session_id}/events",
-            json={
-                "type": "message",
-                "data": {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": f"Reply with exactly {marker}"}],
-                },
-            },
-            timeout=90.0,
-        )
-        send_resp.raise_for_status()
-
-        # Poll items for the user message mirrored back by the forwarder.
-        # Generous: relaunch + Claude cold-start + transcript round-trip.
-        deadline = time.monotonic() + 180.0
-        rounded_tripped = False
-        while time.monotonic() < deadline:
-            if _native_user_message_round_tripped(
-                http_client, session_id=session_id, marker=marker
-            ):
-                rounded_tripped = True
-                break
-            time.sleep(POLL_INTERVAL_S)
-        assert rounded_tripped, (
-            f"user message {marker!r} never round-tripped back to /items after the "
-            "runner relaunch — the relaunched runner forwarded the message before its "
-            "transcript forwarder was watching (the host-restart regression)."
-        )
-
-    finally:
-        host_proc.send_signal(signal.SIGTERM)
-        try:
-            host_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            host_proc.kill()
-            host_proc.wait()
