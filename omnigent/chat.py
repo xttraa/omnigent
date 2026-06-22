@@ -2275,8 +2275,8 @@ async def _query_sessions_once(
     # take many minutes. _ASYNC_TURN_TIMEOUT_S gives each inbox auto-wake
     # turn room to arrive; the global _LOOP_TIMEOUT_S caps the total run.
     _MAX_EXTRA_TURNS = 30
-    _ASYNC_TURN_TIMEOUT_S = 900.0   # 15 min per inbox-wake turn
-    _LOOP_TIMEOUT_S = 1800.0        # 30 min total
+    _ASYNC_TURN_TIMEOUT_S = 900.0  # 15 min per inbox-wake turn
+    _LOOP_TIMEOUT_S = 1800.0  # 30 min total
 
     async def _drain_extra_turns() -> None:
         for _ in range(_MAX_EXTRA_TURNS):
