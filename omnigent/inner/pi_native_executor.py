@@ -53,7 +53,9 @@ class _PolicyServer:
             await self._server.wait_closed()
             self._server = None
 
-    async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def _handle_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         try:
             raw = await reader.readline()
             if not raw:
@@ -67,7 +69,9 @@ class _PolicyServer:
                 return
             token = request.get("token")
             if not isinstance(token, str) or not hmac.compare_digest(token, self.token):
-                writer.write(json.dumps({"id": request.get("id"), "error": "unauthorized"}).encode() + b"\n")
+                writer.write(
+                    json.dumps({"id": request.get("id"), "error": "unauthorized"}).encode() + b"\n"
+                )
                 await writer.drain()
                 return
             req_id = request.get("id")
@@ -90,9 +94,12 @@ class _PolicyServer:
             raw = self._policy_gate(name, args)
             resolved = await raw if asyncio.iscoroutine(raw) or asyncio.isfuture(raw) else raw
             if isinstance(resolved, dict):
-                return {"block": bool(resolved.get("block")), "reason": str(resolved.get("reason") or "")}
+                return {
+                    "block": bool(resolved.get("block")),
+                    "reason": str(resolved.get("reason") or ""),
+                }
             return {"block": False, "reason": ""}
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — fail-open; the verdict path must never wedge Pi
             logger.warning("Pi native policy eval failed for %r: %s", name, exc)
             return {"block": False, "reason": ""}
 
