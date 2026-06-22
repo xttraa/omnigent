@@ -2279,24 +2279,40 @@ async def _query_sessions_once(
     # Single-turn agents: no "waiting" event ever → probe times out in
     # _STATUS_PROBE_TIMEOUT_S (~30 s) and the loop exits.
     _MAX_EXTRA_TURNS = 30
-    _STATUS_PROBE_TIMEOUT_S = 30.0  # probe window to catch session.status:waiting
-    _PER_TURN_TIMEOUT_S = 120.0  # race-window guard for subsequent turns
+    # The server SSE stream has no replay: events published before a client
+    # subscribes are lost. session.status:waiting is emitted by the runner
+    # milliseconds after response.completed — right as _collect_query exits and
+    # the probe subscribes. The probe may miss it in a race.
+    #
+    # Defence-in-depth: a short probe window catches it when timing is right;
+    # refresh() is the authoritative fallback. The runner now emits "waiting"
+    # (not "idle") when sub-agents are running, so the snapshot collapses that
+    # to "running" — a reliable signal even when the probe event is missed.
+    _STATUS_PROBE_TIMEOUT_S = 5.0  # brief window; status events arrive fast
+    _PER_TURN_TIMEOUT_S = 120.0  # race-window guard for synthesis turns
     _LOOP_TIMEOUT_S = 1800.0  # 30 min total
 
     async def _drain_extra_turns() -> None:
-        # Probe: subscribe to catch the session.status:waiting event emitted
-        # after the first turn's CompletedEvent. If no dispatch happened (single-
-        # turn agent), the probe times out and we exit. If the synthesis also
-        # completes within the probe window, its text is collected here too.
+        # Probe: subscribe briefly to catch session.status:waiting if it arrives
+        # before the subscription opens, or synthesis text if sub-agents were
+        # already done. Breaks immediately on "waiting" (flag set) or "idle"
+        # (single-turn agent done).
         probe = await chat.await_turn(timeout=_STATUS_PROBE_TIMEOUT_S)
         if probe.text:
             all_text_parts.append(probe.text)
-        if not chat.last_turn_saw_waiting:
-            return  # No pending dispatch: single-turn agent or synthesis caught.
+        is_async_orchestrator = chat.last_turn_saw_waiting
+        if not is_async_orchestrator and probe.text:
+            return  # Synthesis already arrived in the probe window.
+        if not is_async_orchestrator:
+            # Probe timed out or saw "idle" without "waiting". Use the snapshot
+            # as the authoritative fallback: the runner now emits "waiting"
+            # (not "idle") for sessions with running sub-agents, so the relay
+            # cache holds "waiting" → snapshot returns "running".
+            await chat.refresh()
+            if chat.status not in ("running", "launching"):
+                return  # Truly idle: single-turn agent, or race won cleanly.
+            # Snapshot shows "running" → async orchestrator confirmed via relay.
         # Async orchestrator confirmed. Loop until synthesis text arrives.
-        # Each await_turn resets last_turn_saw_waiting on "running" (synthesis
-        # start), so the flag is False after a clean synthesis and True only
-        # if the synthesizer itself dispatched more sub-agents.
         for _ in range(_MAX_EXTRA_TURNS):
             extra = await chat.await_turn(timeout=_PER_TURN_TIMEOUT_S)
             if extra.text:

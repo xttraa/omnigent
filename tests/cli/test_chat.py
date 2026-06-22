@@ -3290,6 +3290,16 @@ def _fake_sessions_chat_cls(
         def last_turn_saw_waiting(self) -> bool:
             return self._last_turn_saw_waiting
 
+        @property
+        def status(self) -> str:
+            # Mirrors the real snapshot: "running" while sub-agents are pending
+            # (the runner emits "waiting" → relay collapses to "running"),
+            # "idle" when done.
+            return "running" if self._pending else "idle"
+
+        async def refresh(self) -> None:
+            pass  # status is derived from _pending; no fetch needed.
+
         async def query(self, prompt: str) -> QueryResult:
             return await query_impl(prompt)  # type: ignore[return-value]
 
