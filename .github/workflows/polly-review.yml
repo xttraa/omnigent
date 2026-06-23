@@ -377,11 +377,6 @@ jobs:
 
           echo "Egress restricted to: api.github.com${GW_HOST:+, $GW_HOST} + loopback"
 
-      - name: Copy polly config for CI run
-        # Copy to /tmp/polly-ci/ so the source tree is not mutated.
-        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
-        run: cp -r examples/polly /tmp/polly-ci
-
       - name: Run Polly review
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
         id: polly
@@ -401,9 +396,8 @@ jobs:
           # Run Polly headlessly with -p; it starts a local server, sends
           # one turn, prints the assistant response, and exits.
           # --no-session: ephemeral run, no persistent session state.
-          # Uses /tmp/polly-ci/ (copy of examples/polly/); egress is
-          # restricted by the iptables rules set in the previous step.
-          uv run omnigent run /tmp/polly-ci/ \
+          # Egress is restricted by the iptables rules set in the previous step.
+          uv run omnigent run examples/polly/ \
             -p "$prompt" \
             --no-session \
             2>polly-stderr.log \
