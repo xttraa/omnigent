@@ -206,11 +206,9 @@ jobs:
         # were migrated to mock LLM and no longer need it.
         # The native CLIs derive their gateway auth from omnigent provider
         # config. Register the Databricks gateway as the default for both
-        # anthropic (Claude Code) and openai (Codex); the token reaches each
-        # CLI via an env:LLM_API_KEY ref, so no literal secret hits disk.
+        # anthropic (Claude Code) and openai (Codex).
         env:
           GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         run: |
           mkdir -p "$HOME/.omnigent"
           # The Anthropic Messages surface and the Codex Responses surface live
@@ -231,7 +229,6 @@ jobs:
                 # the /anthropic suffix is required — without it Claude Code POSTs
                 # to .../serving-endpoints/v1/messages and gets no reply.
                 base_url: "${GATEWAY_BASE_URL}/anthropic"
-                api_key_ref: "env:LLM_API_KEY"
                 # The default model id is read from models.default (not a
                 # top-level default_model key). Without it the provider
                 # resolves model=None, Claude Code launches with no --model and
@@ -247,7 +244,6 @@ jobs:
                 # OpenAI-compatible surface. wire_api must be 'responses' — codex
                 # >= 0.137 rejects 'chat' at config load.
                 base_url: "${host}/ai-gateway/codex/v1"
-                api_key_ref: "env:LLM_API_KEY"
                 wire_api: responses
                 # The codex model id the e2e codex leg pins (tests/_model_pools).
                 models:
