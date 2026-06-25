@@ -257,19 +257,18 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Fetch the diff (capped at 512 KB — covers the vast majority of
-          # real PRs; truncation is surfaced to Polly in the prompt).
-          # The write-scoped github.token stays in this trusted step and is
-          # NOT passed to the Polly run.
-          # || true: head -c closes the pipe once the cap is reached, causing
-          # gh to get SIGPIPE (exit 141). Under pipefail that would abort the
-          # step; || true degrades it into the DIFF_TRUNCATED path instead.
+          # Fetch the diff. The diff is embedded in the prompt which is passed
+          # via -p CLI arg, so it must fit within Linux ARG_MAX (~2 MB for
+          # argv+env combined). Cap at 128 KB to leave room for the prompt
+          # template, env vars, and other argv. Truncation is surfaced to Polly.
+          # || true: head -c closes the pipe causing SIGPIPE (exit 141) on gh;
+          # under pipefail that would abort the step.
           gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
             -H "Accept: application/vnd.github.v3.diff" \
-            | head -c 524288 > /tmp/pr_diff.txt || true
+            | head -c 131072 > /tmp/pr_diff.txt || true
 
           DIFF_SIZE=$(wc -c < /tmp/pr_diff.txt)
-          [ "$DIFF_SIZE" -ge 524288 ] && DIFF_TRUNCATED=true || DIFF_TRUNCATED=false
+          [ "$DIFF_SIZE" -ge 131072 ] && DIFF_TRUNCATED=true || DIFF_TRUNCATED=false
           export DIFF_TRUNCATED
 
           # Extract lockfile pin changes from the already-fetched diff —
@@ -295,7 +294,7 @@ jobs:
           truncated = os.environ.get("DIFF_TRUNCATED", "false") == "true"
 
           truncation_notice = """
-          > ⚠️ **Diff truncated at 512 KB** — this review covers only the first
+          > ⚠️ **Diff truncated at 128 KB** — this review covers only the first
           > portion of the diff. Flag this as a non-blocking note and recommend
           > a manual review of the remaining changes.
           """ if truncated else ""
