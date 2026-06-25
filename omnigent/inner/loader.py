@@ -252,6 +252,7 @@ def _parse_agent_def(
     agent.runtime = data.get("runtime", False)
     agent.timers = data.get("timers", False)
     agent.spawn = data.get("spawn", False)
+    agent.agent_session_sharing = data.get("agent_session_sharing", "none")
     agent.os_env = _parse_os_env_spec(data.get("os_env"))
 
     # Executor
@@ -682,6 +683,10 @@ def _parse_os_env_spec(data: YamlData | str | bool | None) -> OSEnvSpec | None:
         sandbox=sandbox,
         fork=fork,
         start_in_scratch=start_in_scratch,
+        createos_base_url=str(data["base_url"]) if data.get("base_url") else None,
+        createos_api_key=str(data["api_key"]) if data.get("api_key") else None,
+        createos_shape=str(data["shape"]) if data.get("shape") else None,
+        createos_rootfs=str(data["rootfs"]) if data.get("rootfs") else None,
     )
 
 

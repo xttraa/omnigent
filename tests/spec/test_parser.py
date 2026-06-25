@@ -8,8 +8,9 @@ import pytest
 import yaml
 
 from omnigent.errors import OmnigentError
+from omnigent.inner.datamodel import OSEnvSpec
 from omnigent.spec.parser import discover_host_skills, parse
-from omnigent.spec.types import ApiKeyAuth, DatabricksAuth, ProviderAuth
+from omnigent.spec.types import ApiKeyAuth, DatabricksAuth, ProviderAuth, SharePolicy
 
 
 @pytest.fixture()
@@ -1401,6 +1402,53 @@ def test_parse_os_env_caller_process(tmp_path: Path) -> None:
     assert spec.os_env.fork is False
 
 
+def test_parse_os_env_createos_populates_provider_fields(tmp_path: Path) -> None:
+    """The native parser wires the createos provider keys into the
+    ``createos_*`` fields, in lockstep with the legacy loader.
+
+    What breaks if this fails: an agent loaded via native YAML gets
+    ``type='createos'`` but base_url/api_key/shape/rootfs are silently
+    dropped, so the provider falls back to env vars / defaults only.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "with-createos",
+        "os_env": {
+            "type": "createos",
+            "base_url": "https://api.example.test",
+            "api_key": "sk-test",
+            "shape": "small",
+            "rootfs": "ubuntu-22.04",
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert isinstance(spec.os_env, OSEnvSpec)
+    assert spec.os_env.type == "createos"
+    assert spec.os_env.createos_base_url == "https://api.example.test"
+    assert spec.os_env.createos_api_key == "sk-test"
+    assert spec.os_env.createos_shape == "small"
+    assert spec.os_env.createos_rootfs == "ubuntu-22.04"
+
+
+def test_parse_os_env_createos_fields_default_none(tmp_path: Path) -> None:
+    """Absent createos keys leave the ``createos_*`` fields ``None`` so
+    the provider falls back to env vars / defaults.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "createos-bare",
+        "os_env": {"type": "createos"},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert isinstance(spec.os_env, OSEnvSpec)
+    assert spec.os_env.createos_base_url is None
+    assert spec.os_env.createos_api_key is None
+    assert spec.os_env.createos_shape is None
+    assert spec.os_env.createos_rootfs is None
+
+
 def test_parse_os_env_with_sandbox(tmp_path: Path) -> None:
     """The nested ``sandbox:`` block parses into a real
     :class:`OSEnvSandboxSpec` with all its fields.
@@ -2453,6 +2501,65 @@ def test_parse_spawn_true_sets_flag(tmp_path: Path) -> None:
     (tmp_path / "config.yaml").write_text(yaml.dump(config))
     spec = parse(tmp_path)
     assert spec.spawn is True
+
+
+def test_parse_share_defaults_to_none_when_omitted(agent_dir: Path) -> None:
+    """
+    Without a top-level ``agent_session_sharing:`` key the parsed
+    ``AgentSpec.agent_session_sharing`` is :attr:`SharePolicy.NONE` —
+    sharing is off by default, so ``sys_session_share`` is not
+    registered. A regression flipping the default would expose the
+    access-control mutation (incl. ``__public__``) to every agent.
+
+    :param agent_dir: Temporary agent directory fixture.
+    """
+    spec = parse(agent_dir)
+    assert spec.agent_session_sharing is SharePolicy.NONE
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("none", SharePolicy.NONE),
+        ("non-public", SharePolicy.NON_PUBLIC),
+        ("public", SharePolicy.PUBLIC),
+    ],
+)
+def test_parse_share_maps_each_policy_string(
+    tmp_path: Path,
+    value: str,
+    expected: SharePolicy,
+) -> None:
+    """
+    Each recognized ``agent_session_sharing:`` string round-trips to its
+    :class:`SharePolicy` member. The flag is the sole enabler of
+    ``sys_session_share`` (and ``public`` of the ``__public__`` tier);
+    a parser regression dropping or mismapping it would silently change
+    what the agent is allowed to expose.
+
+    :param tmp_path: pytest-provided temporary directory.
+    :param value: The YAML ``agent_session_sharing:`` string under test.
+    :param expected: The :class:`SharePolicy` it must parse to.
+    """
+    config = {"spec_version": 1, "name": "share-agent", "agent_session_sharing": value}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.agent_session_sharing is expected
+
+
+def test_parse_share_invalid_value_fails_loud(tmp_path: Path) -> None:
+    """
+    An unrecognized ``agent_session_sharing:`` value (here a plausible
+    typo) raises rather than silently disabling sharing — fail-loud, so
+    a misconfigured capability surfaces at parse time instead of becoming
+    a confusing "the tool isn't there" at runtime.
+
+    :param tmp_path: pytest-provided temporary directory.
+    """
+    config = {"spec_version": 1, "name": "bad-share", "agent_session_sharing": "private"}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match="agent_session_sharing"):
+        parse(tmp_path)
 
 
 # ---------------------------------------------------------------------------

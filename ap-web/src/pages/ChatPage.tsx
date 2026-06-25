@@ -51,6 +51,7 @@ import {
   MessageContent,
 } from "@/components/ai-elements/message";
 import { Shimmer } from "@/components/ai-elements/shimmer";
+import { ElicitationCard } from "@/components/blocks/ApprovalCard";
 import { BlockRenderer, FilePathAwareMessageResponse } from "@/components/blocks/BlockRenderer";
 import { CompactionMarker } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
@@ -58,9 +59,11 @@ import { parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { cn } from "@/lib/utils";
+import { validateAttachments } from "@/lib/attachments";
 import { useSurfaceFrontmost } from "@/hooks/useNativeServerSwitcher";
 import {
   isIOSShell,
+  onNativeSidebarDrag,
   onNativeViewModeChanged,
   setNativeServerSwitcherHidden,
   setNativeViewMode,
@@ -246,11 +249,22 @@ export function buildPendingBubbles(
 // bubble. Used by `mergePendingBubbles` and
 // `reorderCommittedRequestElicitations` to keep the prompt above the card
 // that asks about it, both before and after approval.
-function isRequestElicitationBubble(bubble: Bubble): boolean {
+function isStandaloneElicitationBubble(bubble: Bubble): boolean {
+  // A committed assistant bubble that is ENTIRELY an elicitation card with no
+  // turn to anchor to, so it must sit BELOW the user message it gated:
+  //   • REQUEST-phase policy ASKs (gate the prompt before any turn), and
+  //   • terminal-driven harness gates such as cursor-native `pre_tool_use`,
+  //     which never emit `response_created` (blockStream stamps these with
+  //     their own `elicit_*` id, so they land as standalone bubbles).
+  // A `tool_call` card inside an active SDK turn renders inline — it is grouped
+  // WITH the turn, so it is never an all-elicitation standalone bubble — and is
+  // intentionally excluded here.
   return (
     bubble.kind === "assistant" &&
     bubble.items.length > 0 &&
-    bubble.items.every((it) => it.kind === "elicitation" && it.phase === "request")
+    bubble.items.every(
+      (it) => it.kind === "elicitation" && (it.phase === "request" || it.phase === "pre_tool_use"),
+    )
   );
 }
 
@@ -270,7 +284,7 @@ function isRequestElicitationBubble(bubble: Bubble): boolean {
 export function reorderCommittedRequestElicitations(committed: Bubble[]): Bubble[] {
   let result: Bubble[] | null = null;
   for (let i = 0; i < committed.length - 1; i += 1) {
-    if (isRequestElicitationBubble(committed[i]!) && committed[i + 1]!.kind === "user") {
+    if (isStandaloneElicitationBubble(committed[i]!) && committed[i + 1]!.kind === "user") {
       if (result === null) result = [...committed];
       const card = result[i]!;
       result[i] = result[i + 1]!;
@@ -294,11 +308,56 @@ export function reorderCommittedRequestElicitations(committed: Bubble[]): Bubble
 export function mergePendingBubbles(committed: Bubble[], pending: Bubble[]): Bubble[] {
   if (pending.length === 0) return committed;
   let insertAt = committed.length;
-  while (insertAt > 0 && isRequestElicitationBubble(committed[insertAt - 1]!)) {
+  while (insertAt > 0 && isStandaloneElicitationBubble(committed[insertAt - 1]!)) {
     insertAt -= 1;
   }
   if (insertAt === committed.length) return [...committed, ...pending];
   return [...committed.slice(0, insertAt), ...pending, ...committed.slice(insertAt)];
+}
+
+type ElicitationItem = Extract<RenderItem, { kind: "elicitation" }>;
+
+// A pending elicitation is unanswered — only these float to the bottom.
+function isPendingElicitation(item: RenderItem): item is ElicitationItem {
+  return item.kind === "elicitation" && item.status === "pending";
+}
+
+// Pending elicitation cards float to the bottom of the chat: lifted out of
+// their inline position and re-rendered as the last items in the scroll flow,
+// so stick-to-bottom keeps an outstanding question in view no matter how much
+// text the agent streams after it (otherwise the card scrolls up off the top
+// of the viewport). Collect them in document order — oldest first, so the
+// newest sits last, closest to the composer. Once answered, a card drops out
+// of this list (status flips to "responded") and stays inline at its natural
+// spot (it is no longer removed by `stripPendingElicitations`).
+export function collectPendingElicitations(bubbles: Bubble[]): ElicitationItem[] {
+  const pending: ElicitationItem[] = [];
+  for (const bubble of bubbles) {
+    if (bubble.kind !== "assistant") continue;
+    for (const item of bubble.items) {
+      if (isPendingElicitation(item)) pending.push(item);
+    }
+  }
+  return pending;
+}
+
+// Drop the pending elicitation cards from the transcript bubbles so they
+// don't render twice — once at the bottom, once inline. Only clones the
+// assistant bubbles that actually carry a pending card; every other bubble
+// keeps its reference so `BubbleView`'s memo holds. An assistant bubble left
+// with no items renders nothing (`AssistantBubble` returns null), so a
+// standalone elicitation bubble collapses cleanly while its gating user
+// message stays put. Returns the input array unchanged when nothing is
+// pending, so the memo stays stable.
+export function stripPendingElicitations(bubbles: Bubble[]): Bubble[] {
+  let result: Bubble[] | null = null;
+  for (let i = 0; i < bubbles.length; i += 1) {
+    const bubble = bubbles[i]!;
+    if (bubble.kind !== "assistant" || !bubble.items.some(isPendingElicitation)) continue;
+    if (result === null) result = [...bubbles];
+    result[i] = { ...bubble, items: bubble.items.filter((it) => !isPendingElicitation(it)) };
+  }
+  return result ?? bubbles;
 }
 
 // Whether a user bubble should carry the author's avatar badge (and the
@@ -1252,6 +1311,19 @@ function MainAgentSurface({
   );
   const nav = useUserMessageNav(userMessageIds);
 
+  // Pending elicitation cards float to the bottom of the chat: rendered as the
+  // last items in the scroll flow and removed from their inline position so
+  // they don't render twice. Stick-to-bottom then keeps an outstanding
+  // question in view instead of letting trailing text scroll it off the top.
+  // Answered cards stay inline at their natural spot. `streamBubbles` keeps
+  // `bubbles`' reference when nothing is pending, so the common case allocates
+  // nothing.
+  const pendingElicitations = useMemo(() => collectPendingElicitations(bubbles), [bubbles]);
+  const streamBubbles = useMemo(
+    () => (pendingElicitations.length === 0 ? bubbles : stripPendingElicitations(bubbles)),
+    [bubbles, pendingElicitations.length],
+  );
+
   // Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) — guarded so the composer's
   // own unmodified ArrowUp/Down history-recall still works.
   useEffect(() => {
@@ -1309,6 +1381,45 @@ function MainAgentSurface({
   // ConversationScrollRefBridge so the pinned-but-unmasked JumpToTopButton can
   // read and drive the scroll.
   const [scroller, setScroller] = useState<ConversationScroller | null>(null);
+  // While the iOS edge-swipe is driving the sidebar drawer, make the transcript
+  // ignore the finger so it doesn't scroll along with the drag. On iOS the page
+  // is viewport-locked, so the transcript scrolls as an inner overflow:auto
+  // element (`scroller.el`) that the native shell can't reach via
+  // webView.scrollView — it has to be frozen here in the DOM. The native drag
+  // stream marks when a drag is live; for its duration the scroller stops
+  // responding to touch (pointer-events:none), its overflow is locked, and its
+  // scroll offset is pinned so neither a finger-drag nor leftover momentum can
+  // move it. Everything is restored when the drag settles (open/close).
+  useEffect(() => {
+    const el = scroller?.el;
+    if (!el) return;
+    let frozenTop: number | null = null;
+    const pin = () => {
+      if (frozenTop != null) el.scrollTop = frozenTop;
+    };
+    const freeze = () => {
+      if (frozenTop != null) return;
+      frozenTop = el.scrollTop;
+      el.style.pointerEvents = "none";
+      el.style.overflowY = "hidden";
+      el.addEventListener("scroll", pin);
+    };
+    const thaw = () => {
+      if (frozenTop == null) return;
+      el.removeEventListener("scroll", pin);
+      el.style.pointerEvents = "";
+      el.style.overflowY = "auto";
+      frozenTop = null;
+    };
+    const unsubscribe = onNativeSidebarDrag((phase) => {
+      if (phase === "begin" || phase === "move") freeze();
+      else thaw();
+    });
+    return () => {
+      unsubscribe();
+      thaw();
+    };
+  }, [scroller]);
   const [sendScrollNonce, setSendScrollNonce] = useState(0);
   const handleSend = useCallback(
     (text: string, files?: File[]) => {
@@ -1383,6 +1494,7 @@ function MainAgentSurface({
           >
             {/* Scroll helpers — must live inside StickToBottom to access context. */}
             <ScrollToBottomOnSend nonce={sendScrollNonce} />
+            <PreserveScrollDistanceOnResize />
             <ConversationScrollRefBridge onScroller={setScroller} />
             <HistoryAutoLoader
               hasMoreHistory={hasMoreHistory}
@@ -1415,8 +1527,29 @@ function MainAgentSurface({
               )
             ) : (
               <>
-                {bubbles.map((bubble) => (
+                {streamBubbles.map((bubble) => (
                   <BubbleView key={bubbleKey(bubble)} bubble={bubble} />
+                ))}
+                {/* Pending elicitation cards, floated to the bottom of the
+                    chat so an outstanding question stays in view (stick-to-
+                    bottom) no matter how much text the agent streamed after
+                    it. Wrapped in an assistant Message so each matches an
+                    inline card's look; removed from their inline slot by
+                    `stripPendingElicitations`. Newest renders last, nearest
+                    the composer. Rendered ABOVE the Working… indicator so the
+                    card sits closest to the prompt and the shimmer stays the
+                    last thing in the flow. */}
+                {pendingElicitations.map((item) => (
+                  <Message
+                    key={item.elicitationId}
+                    from="assistant"
+                    className="max-w-full"
+                    data-testid="bottom-elicitation"
+                  >
+                    <MessageContent className="w-full">
+                      <ElicitationCard item={item} />
+                    </MessageContent>
+                  </Message>
                 ))}
                 {/* Working… shimmer between send and first rendered block.
                     Suppressed when the last bubble is a compaction spinner —
@@ -1645,6 +1778,76 @@ function ScrollToBottomOnSend({ nonce }: { nonce: number }) {
     scrollToBottom("instant");
     requestAnimationFrame(() => scrollToBottom("instant"));
   }, [nonce, scrollToBottom]);
+
+  return null;
+}
+
+/**
+ * Preserves the transcript's distance-from-bottom whenever its scroll container
+ * resizes on the iOS shell — so the content you're looking at stays put while
+ * the soft keyboard opens/closes (and while the composer grows on focus).
+ *
+ * Two things resize the container, and neither is handled by `use-stick-to-
+ * bottom` (which only re-anchors on *content* resize): the keyboard, via
+ * `useIOSViewportLock` shrinking the app-shell; and the composer growing taller
+ * when focused (its send row / status line), which steals flex height from the
+ * transcript a couple of lines at a time — *without* firing a visualViewport
+ * resize. Watching only visualViewport missed the composer growth, which is why
+ * the transcript crept up ~2 lines on focus.
+ *
+ * So we watch the scroll container itself with a `ResizeObserver` and, on any
+ * size change, hold the scroll position relative to the bottom constant:
+ * `scrollTop = scrollHeight - clientHeight - distance`. `distance` is tracked
+ * from genuine user scrolls only — scrolls that coincide with a dimension change
+ * (the resize's own clamp, or our restore) are ignored so they can't corrupt it.
+ * At the bottom (distance 0) you stay at the bottom; scrolled up reading
+ * history, you keep seeing the same messages. New messages still go through the
+ * library (content resize doesn't change the container's box). Stateless across
+ * any number of keyboard cycles.
+ */
+function PreserveScrollDistanceOnResize() {
+  const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
+    scrollRef?: React.RefObject<HTMLElement>;
+  };
+  const scrollRef = ctx.scrollRef;
+
+  useEffect(() => {
+    if (!isIOSShell()) return;
+    const el = scrollRef?.current;
+    if (!el) return;
+
+    const measure = () => el.scrollHeight - el.clientHeight - el.scrollTop;
+    let distance = Math.max(0, measure());
+    let prevSH = el.scrollHeight;
+    let prevCH = el.clientHeight;
+
+    const onScroll = () => {
+      const sh = el.scrollHeight;
+      const ch = el.clientHeight;
+      // A scroll that lands on the same frame as a size change is resize-induced
+      // (the browser's clamp, or our own restore below) — not the user. Skip it
+      // so it can't overwrite the distance we're trying to preserve.
+      if (sh !== prevSH || ch !== prevCH) {
+        prevSH = sh;
+        prevCH = ch;
+        return;
+      }
+      distance = Math.max(0, measure());
+    };
+
+    const observer = new ResizeObserver(() => {
+      el.scrollTop = el.scrollHeight - el.clientHeight - distance;
+      prevSH = el.scrollHeight;
+      prevCH = el.clientHeight;
+    });
+
+    el.addEventListener("scroll", onScroll, { passive: true });
+    observer.observe(el);
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      observer.disconnect();
+    };
+  }, [scrollRef]);
 
   return null;
 }
@@ -1931,10 +2134,14 @@ export function JumpToTopButton({
 
   return (
     <div
+      // top 50px centers the pill on the chat-scroll-fade border (the mask ramps
+      // 48px→80px), just below the h-14 ChatHeader. z-40 > header z-30. On the
+      // iOS shell the header and fade border shift down by the safe-area inset
+      // (see .chat-scroll-fade in index.css), so add --omnigent-inset-top here
+      // too to keep the pill centered on the border. The var is 0px off-shell.
+      style={{ top: "calc(50px + var(--omnigent-inset-top))" }}
       className={cn(
-        // top-[50px]: centers the pill on the chat-scroll-fade border (the mask
-        // ramps 48px→80px), just below the h-14 ChatHeader. z-40 > header z-30.
-        "pointer-events-none absolute inset-x-0 top-[50px] z-40 flex justify-center transition-opacity duration-150",
+        "pointer-events-none absolute inset-x-0 z-40 flex justify-center transition-opacity duration-150",
         visible ? "opacity-100" : "opacity-0",
       )}
     >
@@ -2753,11 +2960,13 @@ export function buildSlashCommandMap(
   skills: ReadonlyArray<{ name: string; description: string }>,
   showEffort: boolean,
   showModel: boolean,
+  showCompact: boolean = true,
 ): Record<string, string> {
   const m: Record<string, string> = {};
   for (const [name, description] of Object.entries(BUILTIN_SLASH_COMMANDS)) {
     if (name === "/effort" && !showEffort) continue;
     if (name === "/model" && !showModel) continue;
+    if (name === "/compact" && !showCompact) continue;
     m[name] = description;
   }
   for (const skill of skills) {
@@ -2892,6 +3101,34 @@ export function formatModelEffortStatusLabel(
 }
 
 /**
+ * Identity label for the composer status tray: which harness/agent is
+ * running this session. Native vendor wrappers read as the bare vendor
+ * name ("Claude" / "Codex"); SDK/bundle agents read as the agent name
+ * with the brain harness in parens ("Polly (Pi)"). This moved OUT of the
+ * picker trigger (which now shows model/effort) — the trigger is the
+ * model/effort control, so the harness identity belongs in the read-only
+ * shelf below.
+ *
+ * @param modelPickerKind - Native picker family, when the session is a
+ *   claude-/codex-native wrapper.
+ * @param agentName - Bound agent name (lowercase slug), if any.
+ * @param sessionHarness - Effective brain harness id (override-aware).
+ * @returns Display label, or ``null`` when nothing is known.
+ */
+export function composerHarnessLabel(
+  modelPickerKind: NativeModelPickerKind | null,
+  agentName: string | null | undefined,
+  sessionHarness: string | null,
+): string | null {
+  if (modelPickerKind === "claude") return "Claude";
+  if (modelPickerKind === "codex") return "Codex";
+  const display = agentName ? agentDisplayLabel(agentName) : null;
+  const harness = sessionHarness ? (BRAIN_HARNESS_LABELS[sessionHarness] ?? null) : null;
+  if (display && harness) return `${display} (${harness})`;
+  return display ?? harness;
+}
+
+/**
  * Status-line tray tucked behind the composer card: the worktree branch
  * on the left (truncated to an ellipsis so the tray never wraps), the
  * model/effort + context ring on the right. Shares the card's background so the two
@@ -2903,29 +3140,26 @@ export function formatModelEffortStatusLabel(
  * the session has nothing to report. Session cost lives in the header
  * agent-info popover (the "i" button), not here.
  */
-function ComposerStatusLine() {
+function ComposerStatusLine({ harnessLabel }: { harnessLabel: string | null }) {
   const conversationId = useChatStore((s) => s.conversationId);
   const contextWindow = useChatStore((s) => s.contextWindow);
   const tokensUsed = useChatStore((s) => s.tokensUsed);
-  const selectedEffort = useChatStore((s) => s.selectedEffort);
-  const selectedModel = useChatStore((s) => s.selectedModel);
   const codexPlanMode = useChatStore((s) => s.codexPlanMode);
-  const llmModel = useChatStore((s) => s.llmModel);
-  const codexModelOptions = useChatStore((s) => s.codexModelOptions);
   // Seeded from the session snapshot on bind (chatStore.sessionBindingPatch),
   // alongside contextWindow — so the branch reads from the same store as
   // the other status-line values rather than a separate fetch.
   const gitBranch = useChatStore((s) => s.gitBranch);
 
   const showBranch = !!conversationId && !!gitBranch;
-  const modelEffortLabel = conversationId
-    ? formatModelEffortStatusLabel(selectedModel ?? llmModel, selectedEffort, codexModelOptions)
-    : null;
+  // The harness/agent identity (e.g. "Claude", "Polly (Pi)") lives here now;
+  // the picker trigger above owns the model/effort label since it's the
+  // control that changes them.
+  const showHarness = !!conversationId && harnessLabel !== null;
   const showPlanMode = !!conversationId && codexPlanMode;
   // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
   const showRing =
     !!conversationId && contextWindow != null && contextWindow > 0 && tokensUsed != null;
-  if (!showBranch && !showPlanMode && !showRing && modelEffortLabel === null) return null;
+  if (!showBranch && !showPlanMode && !showRing && !showHarness) return null;
 
   return (
     <div
@@ -2967,13 +3201,13 @@ function ComposerStatusLine() {
             <span>Plan mode</span>
           </span>
         )}
-        {modelEffortLabel && (
+        {showHarness && harnessLabel && (
           <span
-            data-testid="composer-model-effort"
+            data-testid="composer-harness"
             className="max-w-36 truncate text-xs text-muted-foreground sm:max-w-52"
-            title={modelEffortLabel}
+            title={harnessLabel}
           >
-            {modelEffortLabel}
+            {harnessLabel}
           </span>
         )}
         {showRing && <ContextRing contextWindow={contextWindow} tokensUsed={tokensUsed} />}
@@ -3090,6 +3324,7 @@ export function Composer({
 }: ComposerProps) {
   const [value, setValue] = useState("");
   const [files, setFiles] = useState<File[]>([]);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
   const [planModeBusy, setPlanModeBusy] = useState(false);
   // Index of the highlighted item in the slash-command suggestions menu.
@@ -3131,6 +3366,14 @@ export function Composer({
   // Per-session cost-control switch, hydrated from the snapshot on bind.
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const codexPlanMode = useChatStore((s) => s.codexPlanMode);
+  // Harness/agent identity shown in the status tray below the card. The
+  // picker trigger owns model/effort now, so the identity moves here.
+  const sessionHarness = useChatStore((s) => s.sessionHarness);
+  const harnessLabel = composerHarnessLabel(
+    modelPickerKind,
+    agents?.find((a) => a.id === selectedAgentId)?.name ?? agents?.[0]?.name ?? null,
+    sessionHarness,
+  );
 
   // Preserve unsent text + file attachments per session so switching
   // tabs and coming back restores the draft. The drafts map lives at
@@ -3201,9 +3444,13 @@ export function Composer({
   // it each turn; native wrappers expose it only when they have a picker
   // path that the runner can propagate without blocking the vendor TUI.
   const showModel = !isNativeWrapper || showModels;
+  // /compact is only functional for native wrappers (claude-native,
+  // codex-native) which inject the slash command into the terminal.
+  // SDK harnesses (openai-agents-sdk, claude-sdk) don't support it yet.
+  const showCompact = isNativeWrapper;
   const slashCommands = useMemo(
-    () => buildSlashCommandMap(skills, showEffort, showModel),
-    [skills, showEffort, showModel],
+    () => buildSlashCommandMap(skills, showEffort, showModel, showCompact),
+    [skills, showEffort, showModel, showCompact],
   );
   // Skills always need an optional argument fill-in so the user can
   // type extra context after the name; built-in commands keep their
@@ -3272,6 +3519,10 @@ export function Composer({
   const executeSlashCommand = (cmd: string, arg: string): boolean => {
     switch (cmd) {
       case "/compact":
+        if (!showCompact) {
+          setCommandError("/compact is not supported for this agent type");
+          return true;
+        }
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
@@ -3406,8 +3657,15 @@ export function Composer({
   const [isDragActive, setIsDragActive] = useState(false);
 
   const addFiles = (incoming: File[]) => {
-    setFiles((prev) => [...prev, ...incoming]);
-    dirtyRef.current = true;
+    // Reject unsupported types (only images, PDF, and text/code) and
+    // oversized files up front — before the upload — with a friendly
+    // message. The server enforces the same limits authoritatively.
+    const { accepted, errors } = validateAttachments(incoming);
+    if (accepted.length > 0) {
+      setFiles((prev) => [...prev, ...accepted]);
+      dirtyRef.current = true;
+    }
+    setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
   };
 
   const handleDrop = (e: DragEvent<HTMLDivElement>) => {
@@ -3440,6 +3698,7 @@ export function Composer({
 
   const removeFile = (index: number) => {
     setFiles((prev) => prev.filter((_, i) => i !== index));
+    setAttachmentError(null);
     dirtyRef.current = true;
   };
 
@@ -3522,6 +3781,7 @@ export function Composer({
     dirtyRef.current = true;
     setValue("");
     setFiles([]);
+    setAttachmentError(null);
     onClearAllQuotes();
   };
 
@@ -3833,6 +4093,12 @@ export function Composer({
             ))}
           </div>
         )}
+        {/* Rejected-attachment feedback: unsupported type or too large */}
+        {attachmentError !== null && (
+          <div className="px-4 pb-2 text-xs text-destructive whitespace-pre-wrap">
+            {attachmentError}
+          </div>
+        )}
         {/* Inline slash-command feedback: errors and /help output */}
         {commandError !== null && (
           <div className="px-4 pb-2 text-xs text-muted-foreground whitespace-pre-wrap">
@@ -3956,7 +4222,7 @@ export function Composer({
           </div>
         </div>
       </div>
-      <ComposerStatusLine />
+      <ComposerStatusLine harnessLabel={harnessLabel} />
     </form>
   );
 }
@@ -4297,38 +4563,55 @@ function AgentPicker({
   const showAgents = !isNativeModelPicker && (agents?.length ?? 0) > 1;
   const rawAgentName = agents?.find((a) => a.id === selectedId)?.name ?? agents?.[0]?.name;
   const agentDisplayName = rawAgentName ? agentDisplayLabel(rawAgentName) : rawAgentName;
-  // Effective brain harness from the session snapshot (override-aware).
-  // Only the SDK brain harnesses get a pill suffix — native wrappers
-  // already use their own "Claude" branch below.
-  const sessionHarness = useChatStore((s) => s.sessionHarness);
-  const harnessLabel = sessionHarness ? (BRAIN_HARNESS_LABELS[sessionHarness] ?? null) : null;
 
-  // Build the pill piece-by-piece so empty selections don't leave
-  // stray separators.
-  const effortLabel = showEffort && selectedEffort ? formatEffortLabel(selectedEffort) : null;
+  // The trigger now names what this control changes: model + effort. The
+  // harness/agent identity moved to the status tray below the card.
+  // qwen/goose/cursor/pi/opencode native wrappers pick their model inside
+  // the vendor TUI, so the bound `llmModel` is an unused default — don't
+  // surface it as if it were live; claude-/codex-native and SDK agents
+  // resolve to a real model.
+  const nativeVendorOwnsModel = useChatStore((s) => s.nativeVendorOwnsModel);
+  const effectiveModel = nativeVendorOwnsModel ? null : (selectedModel ?? llmModel);
+  const modelLabel = formatStatusModelLabel(effectiveModel, codexModelOptions);
+  const effortTriggerLabel =
+    showEffort && selectedEffort
+      ? formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex")
+      : null;
   const hasPickerActions = showAgents || modelOptions.length > 0 || showEffort;
 
-  let triggerLabel: string;
+  // Model in foreground (black), effort in muted (grey). Static fallbacks
+  // first; the final `else` returns null so a session with nothing to show
+  // and nothing to switch doesn't render an empty disabled pill — its
+  // identity is carried by the status tray below.
+  let triggerContent: React.ReactNode;
   if (isLoading) {
-    triggerLabel = "Loading…";
+    triggerContent = "Loading…";
   } else if (!hasAgents) {
-    triggerLabel = "No agents";
-  } else if (modelPickerKind === "claude") {
-    // Native sessions are always scoped to the bound vendor agent. Show just
-    // the vendor name in the pill — model and effort remain selectable in the
-    // dropdown, so spelling them out here only costs horizontal space.
-    triggerLabel = "Claude";
-  } else if (modelPickerKind === "codex") {
-    triggerLabel = "Codex";
-  } else {
-    // The harness reads as part of the identity — "Polly (Pi)" — while
-    // effort stays a separate " · "-joined segment.
-    const nameWithHarness =
-      agentDisplayName && harnessLabel ? `${agentDisplayName} (${harnessLabel})` : agentDisplayName;
-    const parts = [nameWithHarness, effortLabel].filter(
-      (p): p is string => p != null && p.length > 0,
+    triggerContent = "No agents";
+  } else if (modelLabel) {
+    triggerContent = (
+      <>
+        <span className="text-foreground">{modelLabel}</span>
+        {effortTriggerLabel && <span className="text-muted-foreground"> {effortTriggerLabel}</span>}
+      </>
     );
-    triggerLabel = parts.join(" · ");
+  } else if (effortTriggerLabel) {
+    // Vendor owns the model but effort is still switchable from the web UI.
+    triggerContent = <span className="text-muted-foreground">{effortTriggerLabel}</span>;
+  } else if (showAgents) {
+    // No model/effort to surface, but the user can still switch agents —
+    // label the trigger with the current agent so the switcher reads clearly.
+    triggerContent = agentDisplayName;
+  } else if (hasPickerActions) {
+    // The live model/effort isn't resolved yet (e.g. a claude-/codex-native
+    // session before the snapshot fills llmModel/selectedEffort: the generated
+    // spec may carry no executor model and no sticky/override is set), but the
+    // dropdown still has model rows to switch. Keep the trigger rendered — and
+    // the model dropdown + bare-`/model` open path reachable — with a stable
+    // identity fallback rather than hiding the picker entirely.
+    triggerContent = agentDisplayName ?? "Model";
+  } else {
+    return null;
   }
 
   return (
@@ -4342,7 +4625,7 @@ function AgentPicker({
           data-testid="agent-picker-trigger"
           className="h-7 min-w-0 shrink gap-1.5 px-2 text-muted-foreground hover:text-foreground"
         >
-          <span className="min-w-0 truncate text-xs tabular-nums">{triggerLabel}</span>
+          <span className="min-w-0 truncate text-xs tabular-nums">{triggerContent}</span>
           {hasPickerActions && <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />}
         </Button>
       </DropdownMenuTrigger>
